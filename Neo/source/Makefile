@@ -1,9 +1,9 @@
 PROJECT = hrneo
-VERSION = 3.12.0-1
+VERSION = 3.12.1-1
 
-CC_MIPSEL   = mipsel-linux-gnu-gcc
-CC_MIPS     = mips-linux-gnu-gcc
-CC_AARCH64  = aarch64-linux-gnu-gcc
+CC_MIPSEL   = mipsel-linux-muslsf-gcc
+CC_MIPS     = mips-linux-muslsf-gcc
+CC_AARCH64  = aarch64-linux-musl-gcc
 CC_NATIVE   = gcc
 
 COMMON_CFLAGS = -Os -Wall -Wextra -Wno-unused-parameter \
@@ -16,16 +16,17 @@ COMMON_CFLAGS = -Os -Wall -Wextra -Wno-unused-parameter \
 
 COMMON_LDFLAGS = -Wl,--gc-sections -Wl,--build-id=sha1 -s
 
-CFLAGS_MIPSEL  = $(COMMON_CFLAGS) -march=mips32r2 -mtune=1004kc -EL \
+CFLAGS_MIPSEL  = $(COMMON_CFLAGS) -march=mips32r2 -mtune=1004kc -EL -msoft-float \
                  -mno-check-zero-division -mno-shared -mno-plt
-CFLAGS_MIPS    = $(COMMON_CFLAGS) -march=mips32r2 -mtune=1004kc \
+CFLAGS_MIPS    = $(COMMON_CFLAGS) -march=mips32r2 -mtune=1004kc -msoft-float \
                  -mno-check-zero-division -mno-shared -mno-plt
 CFLAGS_AARCH64 = $(COMMON_CFLAGS) -march=armv8-a \
                  -mno-outline-atomics -fno-exceptions
 CFLAGS_NATIVE  = $(COMMON_CFLAGS)
 
 LDFLAGS_STATIC  = $(COMMON_LDFLAGS) -static -static-libgcc
-LDFLAGS_AARCH64 = $(LDFLAGS_STATIC) -Wl,-z,norelro
+LDFLAGS_MIPS    = $(LDFLAGS_STATIC) -no-pie
+LDFLAGS_AARCH64 = $(LDFLAGS_STATIC) -no-pie -Wl,-z,norelro
 LDFLAGS_DYNAMIC = $(COMMON_LDFLAGS)
 
 LIBS =
@@ -38,12 +39,12 @@ all: mipsel mips aarch64
 
 mipsel: CC = $(CC_MIPSEL)
 mipsel: CFLAGS = $(CFLAGS_MIPSEL)
-mipsel: LDFLAGS = $(LDFLAGS_STATIC)
+mipsel: LDFLAGS = $(LDFLAGS_MIPS)
 mipsel: build/$(PROJECT)-mipsel
 
 mips: CC = $(CC_MIPS)
 mips: CFLAGS = $(CFLAGS_MIPS)
-mips: LDFLAGS = $(LDFLAGS_STATIC)
+mips: LDFLAGS = $(LDFLAGS_MIPS)
 mips: build/$(PROJECT)-mips
 
 aarch64: CC = $(CC_AARCH64)

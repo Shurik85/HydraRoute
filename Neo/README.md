@@ -45,6 +45,8 @@
 - Установленная [Entware](https://help.keenetic.com/hc/ru/articles/360021214160)
 - Добавлен системный компонент Keenetic `Xtables-addons для Netfilter`
 
+> Поддерживаются все модели Keenetic на архитектурах mipsel / mips / aarch64, включая бюджетные SoC без аппаратного FPU.
+
 ---
 
 ## Установка и обновление

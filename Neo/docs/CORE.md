@@ -1,12 +1,12 @@
 # HRNeo — техническая документация кодовой базы
 
-Исходный код HRNeo (HydraRoute Neo) v3.12.0-1: архитектура, модули, потоки данных, оптимизации.
+Исходный код HRNeo (HydraRoute Neo) v3.12.1-1: архитектура, модули, потоки данных, оптимизации.
 
 ---
 
 ## 1. Общая архитектура и принцип работы
 
-HRNeo — демон для policy routing на роутерах Keenetic (Entware). Чистый C (без CGO, без внешних библиотек кроме libc и Linux API), единый статически скомпилированный бинарник. Версия 3.12.0-1.
+HRNeo — демон для policy routing на роутерах Keenetic (Entware). Чистый C (без CGO, без внешних библиотек кроме libc и Linux API), единый статически скомпилированный бинарник. Версия 3.12.1-1.
 
 ### Два независимых источника имён хостов
 
@@ -1003,16 +1003,16 @@ hrneo взаимодействует с роутером Keenetic **исключ
 
 ## 16. Система сборки: Makefile
 
-**Версия:** 3.12.0-1
+**Версия:** 3.12.1-1
 **Язык:** C (без CGO, без внешних библиотек)
 
 ### Кросс-компиляция
 
 | Цель | Компилятор | Флаги |
 |------|------------|-------|
-| `mipsel` | `mipsel-linux-gnu-gcc` | `-march=mips32r2 -mtune=1004kc -EL -mno-check-zero-division -mno-shared -mno-plt`, static |
-| `mips` | `mips-linux-gnu-gcc` | `-march=mips32r2 -mtune=1004kc -mno-check-zero-division -mno-shared -mno-plt`, static |
-| `aarch64` | `aarch64-linux-gnu-gcc` | `-march=armv8-a -mno-outline-atomics -fno-exceptions`, static + `-Wl,--strip-all -Wl,-z,norelro` |
+| `mipsel` | `mipsel-linux-muslsf-gcc` | `-march=mips32r2 -mtune=1004kc -EL -msoft-float -mno-check-zero-division -mno-shared -mno-plt`, static `-no-pie` |
+| `mips` | `mips-linux-muslsf-gcc` | `-march=mips32r2 -mtune=1004kc -msoft-float -mno-check-zero-division -mno-shared -mno-plt`, static `-no-pie` |
+| `aarch64` | `aarch64-linux-musl-gcc` | `-march=armv8-a -mno-outline-atomics -fno-exceptions`, static `-no-pie -Wl,-z,norelro` |
 | `native` | `gcc` | dynamic linking |
 
 ### Общие флаги
@@ -1043,7 +1043,7 @@ hrneo взаимодействует с роутером Keenetic **исключ
 - **Netfilter hook:** `/opt/etc/ndm/netfilter.d/015-hrneo.sh` — тонкий хук: читает `/var/run/hrneo.pid`; если процесс живёт в `/proc` — `kill -USR1`
 - **Symlink:** `/opt/bin/neo` → `/opt/etc/init.d/S99hrneo` (создаётся в `postinst`)
 - **postinst:** вставляет `[ $ACTION = start ] && sleep 10` в `rc.unslung` перед запуском, чтобы дать Keenetic поднять интерфейсы (извините, но это решает кучу проблем в т.ч. для другого софта...)
-- **UPX:** не применяется ни к одной архитектуре — снижение ложных срабатываний антивирусов (UPX поверх static-stripped ELF — главный триггер эвристик Mirai/Gafgyt). Подробности — `ANTIVIRUS_FP.md`
+- **UPX:** не применяется ни к одной архитектуре — снижение ложных срабатываний антивирусов (UPX поверх static-stripped ELF — главный триггер эвристик Mirai/Gafgyt).
 - **ELF-гигиена:** GNU build-id (`-Wl,--build-id=sha1` в `COMMON_LDFLAGS`) — стабильный идентификатор и note-секция вместо «голого» ELF
 - **Зависимости ipk:** `libc`, `ipset`, `iptables`, `ip-full`
 - **conffiles:** `/opt/etc/HydraRoute/{hrneo.conf, domain.conf, ip.list}`
@@ -1073,8 +1073,7 @@ hrneo взаимодействует с роутером Keenetic **исключ
 продолжает обход цепочки. hrneo только читает копию, пакет не трогает и вердикт
 не выносит. Поэтому правило hrneo не может «перехватить» трафик у соседних
 NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они работают на той же машине
-без конфликта. Ранние хуки `FORWARD`/`OUTPUT` дают чистый ClientHello до
-возможной десинхронизации соседа. Подробный разбор — `CONFLICT_ZAPRET2.md`.
+без конфликта.
 
 Логи различают источник тегом: `[DNS]` / `[TLS-SNI]` / `[HTTP-Host]`.
 
@@ -1092,7 +1091,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 - Вся системная логика в C-демоне; shell-хук `015-hrneo.sh` «тонкий» (только `kill -USR1`). Нет «зомби-скриптов» при остановленном демоне. `S99hrneo` минимальный.
 - Один NFLOG-сокет; диспетчер разводит по `dport`.
-- **NFLOG вместо NFQUEUE:** L7 только читает SNI/Host, пакет не модифицирует — назначение NFLOG, а не NFQUEUE. Нетерминирующая цель устраняет конкуренцию за трафик с zapret2/nfqws2 (см. `CONFLICT_ZAPRET2.md`). Нет verdict-сообщений → нагрузка ниже, чем у прежней NFQUEUE-схемы. Без fallback: нет модулей NFLOG → L7 выключается (`LOG_WARN`), демон работает на DNS-канале.
+- **NFLOG вместо NFQUEUE:** L7 только читает SNI/Host, пакет не модифицирует — назначение NFLOG, а не NFQUEUE. Нетерминирующая цель устраняет конкуренцию за трафик с zapret2/nfqws2. Нет verdict-сообщений → нагрузка ниже, чем у прежней NFQUEUE-схемы. Без fallback: нет модулей NFLOG → L7 выключается (`LOG_WARN`), демон работает на DNS-канале.
 - **Хуки FORWARD+OUTPUT, не POSTROUTING:** `FORWARD` покрывает forwarded LAN→WAN (после routing-decision доступен `-o WAN`), `OUTPUT` — соединения самого роутера. Ранний по ходу пакета хук даёт чистый ClientHello до десинхронизации соседнего NFQUEUE-демона.
 - Идемпотентность к DNS: `ipset_add_batch` с `NLM_F_EXCL` → двойное добавление IP no-op. Два источника (DNS + L7) безопасно пересекаются.
 - **Conntrack-реконнект L7 (`conntrack_delete_conn`):** L7 видит SNI/Host уже после установления TCP-соединения, выпущенного через WAN (до попадания dst-IP в ipset). Чтобы соединение пошло по политике, hrneo при **первом** добавлении IP (`process_hostname_event` вернул `> 0`, т.е. `NLM_F_EXCL`-новый) и при `ConntrackFlush=true` точечно удаляет conntrack-запись этого соединения по полному 5-tuple. Следующий пакет переоценивает `CONNMARK`-правила, смена src/NAT через политику вынуждает легитимный реконнект. Ранее здесь использовалась инъекция spoof-RST клиенту (`l7_rst.c`, удалён): RST как in-band-пакет обязан совпасть с `rcv_nxt` (RFC 5961, strict) и проигрывал гонку с ответом сервера — на практике соединение не рвалось и шло мимо политики. conntrack-DELETE действует на состоянии ядра, проверки seq-окна нет → надёжно. Удаляется только триггернувшее соединение (точно по 5-tuple, без коллатерали); полный conntrack-DUMP из L7 не вызывается — это прерогатива DNS-канала.
@@ -1133,7 +1132,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 ## Резюме
 
-**HRNeo v3.12.0-1** — компактный однопоточный policy routing демон для роутеров Keenetic, написанный на чистом C.
+**HRNeo v3.12.1-1** — компактный однопоточный policy routing демон для роутеров Keenetic, написанный на чистом C.
 
 Два источника имён хостов:
 
