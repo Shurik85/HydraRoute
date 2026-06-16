@@ -169,7 +169,8 @@ void process_hostname_event_l7(const char *host, int proto,
                                const l7_conn_t *conn) {
     parsed_cidr_t entry;
     memset(&entry, 0, sizeof(entry));
-    const char *tag = (proto == L7_TLS) ? "TLS-SNI" : "HTTP-Host";
+    const char *tag = (proto == L7_TLS) ? "TLS-SNI" :
+                     (proto == L7_QUIC) ? "QUIC-SNI" : "HTTP-Host";
     int new_count;
 
     if (conn->family == AF_INET) {
@@ -477,7 +478,8 @@ int main(int argc, char *argv[]) {
         } else {
             LOG_INFO("L7 WAN interface: %s", g_l7_wan);
             l7_firewall_load_kmod("xt_connbytes");
-            l7_dispatch_set_enable(g_config.l7_enable_tls, g_config.l7_enable_http);
+            l7_dispatch_set_enable(g_config.l7_enable_tls, g_config.l7_enable_http,
+                                   g_config.l7_enable_quic);
 
             if (g_config.l7_tcp_reasm_enabled) {
                 if (tcp_reasm_init(&g_reasm,
@@ -499,9 +501,10 @@ int main(int argc, char *argv[]) {
                                    l7_dispatch_packet, NULL) == 0) {
                 if (l7_firewall_install(&g_config, g_l7_wan) == 0) {
                     g_l7_active = 1;
-                    LOG_INFO("L7 capture enabled via NFLOG group #%d (TLS=%d HTTP=%d)",
+                    LOG_INFO("L7 capture enabled via NFLOG group #%d (TLS=%d HTTP=%d QUIC=%d)",
                              g_config.l7_nflog_group,
-                             g_config.l7_enable_tls, g_config.l7_enable_http);
+                             g_config.l7_enable_tls, g_config.l7_enable_http,
+                             g_config.l7_enable_quic);
                 } else {
                     LOG_WARN("L7 firewall install failed; closing NFLOG, DNS-only mode");
                     nflog_capture_close(&g_nflog);

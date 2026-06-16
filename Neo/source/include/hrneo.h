@@ -100,6 +100,7 @@ typedef struct {
     int l7_tcp_reasm_enabled;
     int l7_tcp_reasm_max_entries;
     int l7_tcp_reasm_ttl_sec;
+    int l7_enable_quic;
 } config_t;
 
 typedef struct {

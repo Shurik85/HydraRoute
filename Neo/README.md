@@ -33,7 +33,7 @@
 - Поддержка статических CIDR-диапазонов с IPv4 и IPv6
 - Работа с базами GeoIP и GeoSite в формате v2ray/xray `.dat`
 - Перехват DNS-ответов LAN- и VPN-клиентов роутера (Ethernet, PPP, WireGuard, VPN-сервер, IPsec, туннели)
-- Параллельный L7-канал (опц.): TLS SNI и HTTP Host через NFLOG с TCP-реассамблецией длинных ClientHello (Kyber/MLKEM)
+- Параллельный L7-канал (опц.): TLS SNI, HTTP Host и QUIC Initial SNI через NFLOG с TCP-реассамблецией длинных ClientHello (Kyber/MLKEM)
 - Корректная маршрутизация без переподключения (опц. ConntrackFlush)
 - Управление через веб-интерфейс
 
@@ -94,7 +94,7 @@ opkg update && opkg upgrade
 
 ## Параметры hrneo.conf
 
-Всего **27 параметров** конфигурации, сгруппированных по назначению:
+Всего **28 параметров** конфигурации, сгруппированных по назначению:
 
 - **Основные:** `autoStart`, `watchlistPath`, `clearIPSet`
 - **CIDR:** `CIDR`, `CIDRfile`
@@ -104,7 +104,7 @@ opkg update && opkg upgrade
 - **Conntrack:** `ConntrackFlush`
 - **Маршрутизация:** `GlobalRouting`, `PolicyOrder`
 - **GeoIP / GeoSite:** `GeoIPFile`, `GeoSiteFile` (оба повторяемые)
-- **L7-перехват:** `l7CaptureEnabled`, `l7NflogGroup`, `l7EnableTLS`, `l7EnableHTTP`, `l7WanInterface`, `l7ConnbytesMax`, `l7TcpReasmEnabled`, `l7TcpReasmMaxEntries`, `l7TcpReasmTtlSec`
+- **L7-перехват:** `l7CaptureEnabled`, `l7NflogGroup`, `l7EnableTLS`, `l7EnableHTTP`, `l7EnableQUIC`, `l7WanInterface`, `l7ConnbytesMax`, `l7TcpReasmEnabled`, `l7TcpReasmMaxEntries`, `l7TcpReasmTtlSec`
 
 > Полное описание каждого параметра, дефолтов, поведения и взаимодействия с роутером (RCI, PolicyOrder, ConntrackFlush и т.д.) — см. **[docs/HRNEO.CONF.md](docs/HRNEO.CONF.md)**.
 
@@ -200,11 +200,11 @@ geoip:ru
 - hardcoded-IP с TLS SNI (без DNS-резолва)
 - легаси-HTTP
 - тёплый DNS-кэш устройства (TTL ещё не истёк)
+- quic / http-3 (UDP/443)
 
-L7 видит имя хоста уже после установления соединения (выпущенного через WAN до попадания IP в ipset). Поэтому при первом добавлении такого IP Neo сбрасывает триггернувшее соединение единичным TCP RST в сторону клиента — браузер мгновенно переустанавливает его новым соединением, которое с самого начала идёт по нужной политике, без обрыва в середине TLS-хендшейка.
+L7 видит имя хоста уже после установления соединения (выпущенного через WAN до попадания IP в ipset). При первом добавлении IP Neo точечно удаляет conntrack-запись триггернувшего соединения по 5-tuple — браузер/приложение переустанавливает соединение, которое с самого начала идёт по нужной политике.
 
 **Известные ограничения:**
-- **QUIC / HTTP-3 (UDP/443)** — не реализовано; значимо для Apple-устройств (Safari/iCloud/Push активно используют h3)
 - **ECH (Encrypted ClientHello)** — нерешаемо без MITM
 - **iCloud Private Relay** — by design зашифрованный туннель
 

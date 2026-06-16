@@ -1,6 +1,7 @@
 #include "../include/l7_dispatch.h"
 #include "../include/probe_tls.h"
 #include "../include/probe_http.h"
+#include "../include/probe_quic.h"
 #include "../include/bogon.h"
 #include "../include/tcp_reasm.h"
 #include <string.h>
@@ -8,11 +9,13 @@
 
 static int l7_tls_enabled  = 1;
 static int l7_http_enabled = 1;
+static int l7_quic_enabled = 1;
 static tcp_reasm_t *g_reasm_ref;
 
-void l7_dispatch_set_enable(int tls_enabled, int http_enabled) {
+void l7_dispatch_set_enable(int tls_enabled, int http_enabled, int quic_enabled) {
     l7_tls_enabled  = tls_enabled  ? 1 : 0;
     l7_http_enabled = http_enabled ? 1 : 0;
+    l7_quic_enabled = quic_enabled ? 1 : 0;
 }
 
 void l7_dispatch_set_reasm(struct tcp_reasm *reasm) {
@@ -78,7 +81,7 @@ void l7_dispatch_packet(const uint8_t *pkt, int len,
                         void *user) {
     (void)mark; (void)ifin; (void)ifout; (void)user;
 
-    if (len < 40) return;
+    if (len < 28) return;
 
     uint8_t ipver = (pkt[0] >> 4) & 0xF;
     int ip_hlen;
@@ -89,14 +92,14 @@ void l7_dispatch_packet(const uint8_t *pkt, int len,
 
     if (ipver == 4) {
         ip_hlen = (pkt[0] & 0xF) * 4;
-        if (ip_hlen < 20 || len < ip_hlen + 20) return;
+        if (ip_hlen < 20 || len < ip_hlen + 8) return;
         l4_proto = pkt[9];
         saddr = pkt + 12;
         daddr = pkt + 16;
         dst_family = AF_INET;
     } else if (ipver == 6) {
         ip_hlen = 40;
-        if (len < 60) return;
+        if (len < 48) return;
         l4_proto = pkt[6];
         saddr = pkt + 8;
         daddr = pkt + 24;
@@ -105,7 +108,41 @@ void l7_dispatch_packet(const uint8_t *pkt, int len,
         return;
     }
 
+    if (l4_proto == IPPROTO_UDP) {
+        if (!l7_quic_enabled) return;
+        const uint8_t *udp = pkt + ip_hlen;
+        if (len < ip_hlen + 8) return;
+        uint16_t sport = ((uint16_t)udp[0] << 8) | udp[1];
+        uint16_t dport = ((uint16_t)udp[2] << 8) | udp[3];
+        if (dport != 443) return;
+
+        const uint8_t *quic = udp + 8;
+        int quic_len = len - ip_hlen - 8;
+        if (quic_len < 20) return;
+
+        char host[256];
+        if (!quic_extract_sni(quic, quic_len, host, sizeof(host))) return;
+        if (bogon_check(daddr, dst_family)) return;
+
+        l7_conn_t conn;
+        memset(&conn, 0, sizeof(conn));
+        conn.family = (uint8_t)dst_family;
+        conn.proto  = IPPROTO_UDP;
+        conn.client_port = sport;
+        conn.server_port = dport;
+        if (dst_family == AF_INET) {
+            memcpy(conn.client_ip, saddr, 4);
+            memcpy(conn.server_ip, daddr, 4);
+        } else {
+            memcpy(conn.client_ip, saddr, 16);
+            memcpy(conn.server_ip, daddr, 16);
+        }
+        process_hostname_event_l7(host, L7_QUIC, &conn);
+        return;
+    }
+
     if (l4_proto != IPPROTO_TCP) return;
+    if (len < ip_hlen + 20) return;
 
     const uint8_t *tcp = pkt + ip_hlen;
     uint16_t sport = ((uint16_t)tcp[0] << 8) | tcp[1];
@@ -127,6 +164,7 @@ void l7_dispatch_packet(const uint8_t *pkt, int len,
     l7_conn_t conn;
     memset(&conn, 0, sizeof(conn));
     conn.family = (uint8_t)dst_family;
+    conn.proto  = IPPROTO_TCP;
     conn.client_port = sport;
     conn.server_port = dport;
     if (dst_family == AF_INET) {

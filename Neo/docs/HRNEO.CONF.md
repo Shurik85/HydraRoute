@@ -2,7 +2,7 @@
 
 Справочник по параметрам конфигурационного файла `hrneo.conf`, CLI-флагам и формату вспомогательных файлов (`domain.conf`, `ip.list`).
 
-**Версия кода:** hrneo 3.12.1-1
+**Версия кода:** hrneo 3.14.0-1
 
 ---
 
@@ -81,6 +81,7 @@ hrneo [OPTIONS]
 --l7TcpReasmEnabled <true|false>
 --l7TcpReasmMaxEntries <int>
 --l7TcpReasmTtlSec <seconds>
+--l7EnableQUIC <true|false>
 ```
 
 ---
@@ -482,7 +483,7 @@ Content-Type: application/json
   8. при **первом** добавлении этого IP (он был выпущен через WAN до попадания в ipset) и при `ConntrackFlush=true` hrneo точечно удаляет conntrack-запись триггернувшего соединения по 5-tuple — соединение реконнектится через политику, а не остаётся в обход неё до таймаута
 - `NFLOG` — нетерминирующая цель: пакет только копируется и продолжает обычный путь, hrneo его не модифицирует. Это делает L7-канал совместимым с DPI-десинхронизаторами (zapret2 / nfqws2 / tpws), которые используют `NFQUEUE` на той же машине, — взаимного «голодания» по трафику нет (разбор — `CONFLICT_ZAPRET2.md`)
 - разрыв триггернувшего соединения подчинён флагу `ConntrackFlush` (см. раздел «Conntrack»): при `ConntrackFlush=false` L7 не сбрасывает соединение, и трафик к хосту остаётся в обход политики до реконнекта приложением. Удаляется только триггернувшее соединение, точечно по 5-tuple, без полного DUMP таблицы
-- закрывает «слепые зоны» DNS-only схемы: клиенты с DoH/DoT/DoQ, hardcoded-IP с TLS SNI, легаси-HTTP
+- закрывает «слепые зоны» DNS-only схемы: клиенты с DoH/DoT/DoQ, hardcoded-IP с TLS SNI, легаси-HTTP, QUIC/HTTP-3 (Safari/iCloud/h3)
 - расшифровка DoH/DoT/DoQ/ECH невозможна (требует MITM) и не делается
 - горячее переключение не поддерживается; смена флага требует `/opt/etc/init.d/S99hrneo restart`
 
@@ -564,9 +565,35 @@ TTL неполных записей в секундах.
 
 ---
 
+## QUIC-перехват (UDP/443)
+
+### `l7EnableQUIC=true`
+
+Парсить QUIC Initial SNI на UDP `dport 443`.
+
+- `true` (по умолчанию) — при `l7CaptureEnabled=true` hrneo устанавливает дополнительные правила NFLOG для UDP/443 с фильтром длины `--length 1200:` (QUIC Initial обязательно padded до ≥1200 байт по RFC 9000). Для каждого попавшего пакета запускается QUIC CRYPTO-walker (`probe_quic.c`):
+  1. Проверка Long Header (`pkt[0] & 0xC0 == 0xC0`) и версии (v1: `0x00000001`, v2: `0x6b3343cf`)
+  2. Определение Initial-типа: `(pkt[0] & 0x30) == 0x00` (v1) или `== 0x10` (v2)
+  3. Извлечение DCID → вывод ключей через HKDF-Extract + 3× HKDF-Expand-Label
+  4. Снятие Header Protection (AES-128-ECB) → расшифровка payload (AES-128-CTR)
+  5. Frame walker с полным разбором ACK-фреймов → CRYPTO frame → SNI
+  6. Результат добавляется в watchlist-ipset с тегом `[QUIC-SNI]`
+- `false` — UDP/443 не перехватывается; UDP NFLOG-правила не устанавливаются; `quic_extract_sni` не вызывается
+- имеет эффект только при `l7CaptureEnabled=true`
+- QUIC-соединения имеют conntrack-записи с `proto=17` (UDP); при `ConntrackFlush=true` и первом добавлении IP — точечный DELETE по 5-tuple UDP, как и для TCP
+
+**Ключевые детали реализации:**
+
+- **Соли:** QUIC v1 RFC 9001 `38762cf7f55934b34d179ae6a4c80cadccbb7f0a`, v2 RFC 9369 `0dede3def700a6db819381be6e269dcbf9bd2ed9`
+- **Дешифровка:** AES-128-CTR, не GCM (верификация тега пропускается) — достаточно для извлечения SNI
+- **ACK-frame skip:** в отличие от простых парсеров, hrneo полностью разбирает ACK(0x02)/ACK_ECN(0x03) через varint-поля, не прерываясь на них — позволяет найти CRYPTO-фрейм, идущий после ACK
+- **Криптография:** pure-C SHA-256, HMAC, HKDF, AES-128 в `src/quic_crypto.c`; только целочисленные операции — работает на MIPS soft-float без аппаратного FPU
+
+---
+
 ## Системные требования для `l7CaptureEnabled=true`
 
-- `iptables`/`ip6tables` с поддержкой матчей `connbytes`, `length`, `tcp` + target `NFLOG`
+- `iptables`/`ip6tables` с поддержкой матчей `connbytes`, `length`, `tcp`, `udp` + target `NFLOG`
 - kernel-модули `nfnetlink_log`, `xt_NFLOG` — на Keenetic присутствуют в `/lib/modules`, но не автозагружаются; hrneo подгружает сам через syscall `init_module` (порядок: `nfnetlink_log`, затем `xt_NFLOG`). Если их нет — L7 отключается **без fallback**, демон работает на DNS-канале
 - kernel-модуль `xt_connbytes` — аналогично, hrneo подгружает сам через `init_module`
 - демон запущен от root (доступ к `NETLINK_NETFILTER` для NFLOG и conntrack-DELETE, `AF_PACKET`, `init_module`)
@@ -578,19 +605,21 @@ TTL неполных записей в секундах.
 [INFO]  kmod nfnetlink_log loaded
 [INFO]  kmod xt_NFLOG loaded
 [INFO]  kmod xt_connbytes loaded
-[INFO]  L7 firewall rules installed (new=8, already present=0, wan=eth3, nflog-group=210)
-[INFO]  L7 capture enabled via NFLOG group #210 (TLS=1 HTTP=1)
+[INFO]  L7 firewall rules installed (new=12, already present=0, wan=eth3, nflog-group=210)
+[INFO]  L7 capture enabled via NFLOG group #210 (TLS=1 HTTP=1 QUIC=1)
 [WARN]  L7 capture: WAN interface unknown; L7 disabled, DNS-only mode
 [WARN]  L7 capture: NFLOG kernel modules unavailable; L7 disabled, DNS-only mode
 [WARN]  L7 firewall install failed; closing NFLOG, DNS-only mode
 [MATCH] [TLS-SNI] target.example -> HydraRoute
 [PROCESSED] [TLS-SNI] target.example -> 1.2.3.4 [HydraRoute]
 [DEBUG] conntrack: deleted L7 conn (family 2)
+[MATCH] [QUIC-SNI] quic.example -> HydraRoute
+[PROCESSED] [QUIC-SNI] quic.example -> 1.2.3.4 [HydraRoute]
 [MATCH] [HTTP-Host] legacy.example -> Other
 [MATCH] [DNS] target.example -> HydraRoute
 ```
 
-> Теги `[DNS]` / `[TLS-SNI]` / `[HTTP-Host]` различают источник во всех логах.
+> Теги `[DNS]` / `[TLS-SNI]` / `[HTTP-Host]` / `[QUIC-SNI]` различают источник во всех логах.
 
 ---
 

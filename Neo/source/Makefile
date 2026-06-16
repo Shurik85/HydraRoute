@@ -1,5 +1,5 @@
 PROJECT = hrneo
-VERSION = 3.12.1-1
+VERSION = 3.14.0-1
 
 CC_MIPSEL   = mipsel-linux-muslsf-gcc
 CC_MIPS     = mips-linux-muslsf-gcc
@@ -31,7 +31,7 @@ LDFLAGS_DYNAMIC = $(COMMON_LDFLAGS)
 
 LIBS =
 
-SRCS = src/main.c src/util.c src/log.c src/config.c src/args.c src/params.c src/watchlist.c src/ipset_nl.c src/dns.c src/packet_capture.c src/iptables.c src/signal_handler.c src/rci.c src/conntrack.c src/geodat.c src/routing.c src/probe_tls.c src/probe_http.c src/bogon.c src/nflog_capture.c src/l7_dispatch.c src/l7_firewall.c src/tcp_reasm.c
+SRCS = src/main.c src/util.c src/log.c src/config.c src/args.c src/params.c src/watchlist.c src/ipset_nl.c src/dns.c src/packet_capture.c src/iptables.c src/signal_handler.c src/rci.c src/conntrack.c src/geodat.c src/routing.c src/probe_tls.c src/probe_http.c src/probe_quic.c src/quic_crypto.c src/bogon.c src/nflog_capture.c src/l7_dispatch.c src/l7_firewall.c src/tcp_reasm.c
 
 .PHONY: all clean mipsel mips aarch64 native
 

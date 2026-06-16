@@ -199,6 +199,52 @@ static int apply_one(const char *cmd, const char *op, const char *chain,
 static const char *const L7_CMDS[]   = {"iptables", "ip6tables"};
 static const char *const L7_CHAINS[] = {"FORWARD", "OUTPUT"};
 
+static int build_quic_rule_argv(char **out, char buf[][64],
+                                const char *cmd, const char *op, const char *chain,
+                                const char *wan, int group) {
+    int i = 0;
+    snprintf(buf[0],  64, "%s", cmd);     out[i++] = buf[0];
+    snprintf(buf[1],  64, "-w");          out[i++] = buf[1];
+    snprintf(buf[2],  64, "-t");          out[i++] = buf[2];
+    snprintf(buf[3],  64, "mangle");      out[i++] = buf[3];
+    snprintf(buf[4],  64, "%s", op);      out[i++] = buf[4];
+    snprintf(buf[5],  64, "%s", chain);   out[i++] = buf[5];
+    snprintf(buf[6],  64, "-o");          out[i++] = buf[6];
+    snprintf(buf[7],  64, "%s", wan);     out[i++] = buf[7];
+    snprintf(buf[8],  64, "-p");          out[i++] = buf[8];
+    snprintf(buf[9],  64, "udp");         out[i++] = buf[9];
+    snprintf(buf[10], 64, "--dport");     out[i++] = buf[10];
+    snprintf(buf[11], 64, "443");         out[i++] = buf[11];
+    snprintf(buf[12], 64, "-m");          out[i++] = buf[12];
+    snprintf(buf[13], 64, "length");      out[i++] = buf[13];
+    snprintf(buf[14], 64, "--length");    out[i++] = buf[14];
+    snprintf(buf[15], 64, "1200:");       out[i++] = buf[15];
+    snprintf(buf[16], 64, "-j");          out[i++] = buf[16];
+    snprintf(buf[17], 64, "NFLOG");       out[i++] = buf[17];
+    snprintf(buf[18], 64, "--nflog-group"); out[i++] = buf[18];
+    snprintf(buf[19], 64, "%d", group);   out[i++] = buf[19];
+    out[i] = NULL;
+    return i;
+}
+
+static int quic_rule_exists(const char *cmd, const char *chain,
+                            const char *wan, int group) {
+    char abuf[22][64];
+    char *argv[23];
+    build_quic_rule_argv(argv, abuf, cmd, "-C", chain, wan, group);
+    char out[256];
+    return run_command_output(cmd, argv, out, sizeof(out)) == 0;
+}
+
+static int quic_apply_one(const char *cmd, const char *op, const char *chain,
+                          const char *wan, int group) {
+    char abuf[22][64];
+    char *argv[23];
+    build_quic_rule_argv(argv, abuf, cmd, op, chain, wan, group);
+    char out[256];
+    return run_command_output(cmd, argv, out, sizeof(out));
+}
+
 typedef struct {
     int dport;
     int connbytes_max;
@@ -235,6 +281,18 @@ int l7_firewall_install(const config_t *cfg, const char *wan_iface) {
                              L7_CMDS[c], L7_CHAINS[ch], specs[p].dport);
                 }
             }
+
+            if (cfg->l7_enable_quic) {
+                if (quic_rule_exists(L7_CMDS[c], L7_CHAINS[ch], wan_iface, group)) {
+                    present++;
+                } else if (quic_apply_one(L7_CMDS[c], "-A", L7_CHAINS[ch],
+                                          wan_iface, group) == 0) {
+                    installed++;
+                } else {
+                    LOG_WARN("L7 firewall: %s -A %s udp/443 QUIC failed",
+                             L7_CMDS[c], L7_CHAINS[ch]);
+                }
+            }
         }
     }
     if (installed > 0)
@@ -257,6 +315,11 @@ int l7_firewall_remove(const config_t *cfg, const char *wan_iface) {
                                   specs[p].dport, specs[p].connbytes_max, group) != 0)
                         break;
                 }
+            }
+            while (quic_rule_exists(L7_CMDS[c], L7_CHAINS[ch], wan_iface, group)) {
+                if (quic_apply_one(L7_CMDS[c], "-D", L7_CHAINS[ch],
+                                   wan_iface, group) != 0)
+                    break;
             }
         }
     }

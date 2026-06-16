@@ -250,7 +250,7 @@ int conntrack_delete_conn(conntrack_mgr_t *m, const l7_conn_t *c) {
     ct_nest_end(buf, off, iptup);
 
     int proto = ct_nest_begin(buf, &off, CTA_TUPLE_PROTO);
-    uint8_t proto_num = IPPROTO_TCP;
+    uint8_t proto_num = c->proto ? c->proto : IPPROTO_TCP;
     uint16_t sport = htons(c->client_port);
     uint16_t dport = htons(c->server_port);
     ct_put_attr(buf, &off, CTA_PROTO_NUM, &proto_num, 1);

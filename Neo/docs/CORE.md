@@ -1,6 +1,6 @@
 # HRNeo — техническая документация кодовой базы
 
-Исходный код HRNeo (HydraRoute Neo) v3.12.1-1: архитектура, модули, потоки данных, оптимизации.
+Исходный код HRNeo (HydraRoute Neo) v3.14.0-1: архитектура, модули, потоки данных, оптимизации.
 
 ---
 
@@ -11,11 +11,11 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
 ### Два независимых источника имён хостов
 
 - **DNS-канал** (всегда): перехват DNS-ответов dnsmasq через AF_PACKET SOCK_DGRAM + L3-BPF. Работает на интерфейсах любого типа — Ethernet, PPP, ARPHRD_NONE (WireGuard, VPN-сервер, IPsec, туннели). Ловит DNS и LAN-, и VPN-клиентов.
-- **L7-канал** (опционально, `l7CaptureEnabled`): перехват TLS SNI / HTTP Host исходящих соединений через NFLOG (пассивное копирование пакета, нетерминирующая цель). Фаза 2 — TCP-реассамблеция длинных ClientHello. Подробно — раздел [18](#18-l7-перехват-tls-sni--http-host--tcp-реассамблеция).
+- **L7-канал** (опционально, `l7CaptureEnabled`): перехват TLS SNI / HTTP Host / QUIC Initial SNI исходящих соединений через NFLOG (пассивное копирование пакета, нетерминирующая цель). Фаза 2 — TCP-реассамблеция длинных ClientHello. QUIC — CRYPTO-walker с дешифровкой Initial-пакета. Подробно — раздел [18](#18-l7-перехват-tls-sni--http-host--tcp-реассамблеция).
 
 ### Принцип работы (пошагово)
 
-1. Читается конфигурация из `/opt/etc/HydraRoute/hrneo.conf` (27 параметров; CLI-флаги поверх конфига; недостающие — встроенные дефолты).
+1. Читается конфигурация из `/opt/etc/HydraRoute/hrneo.conf` (28 параметров; CLI-флаги поверх конфига; недостающие — встроенные дефолты).
 
 2. Если `DirectRouteEnabled=true` — сканируется `/sys/class/net/`, строится карта системных интерфейсов (`drm_scan_interfaces`): для каждого имени читается `/sys/class/net/<name>/operstate` (`up`/`down`/`unknown`). Карта нужна, чтобы при разборе watchlist различать «политика Keenetic» и «сетевой интерфейс для DirectRoute».
 
@@ -107,7 +107,7 @@ DNS-ответ dnsmasq → клиент (любой интерфейс: br0/WG/V
    → ip rule fwmark → table X → ip route default dev <interface>
 ```
 
-### Файловая структура (23 файла `.c`)
+### Файловая структура (25 файлов `.c`)
 
 | Файл | Назначение |
 |------|------------|
@@ -120,7 +120,7 @@ DNS-ответ dnsmasq → клиент (любой интерфейс: br0/WG/V
 | `src/args.c` | Парсинг CLI, наложение на config |
 | `src/params.c` | PARAMS[] — таблица описания параметров (single source of truth для config/args/help/genconfig) |
 | `src/ipset_nl.c` | Низкоуровневая работа с ipset через netlink |
-| `src/conntrack.c` | Сброс conntrack-записей через netlink: DUMP+DELETE по dst-IP (DNS-канал) и точечный DELETE по 5-tuple (L7-канал) |
+| `src/conntrack.c` | Сброс conntrack-записей через netlink: DUMP+DELETE по dst-IP (DNS-канал) и точечный DELETE по 5-tuple (L7-канал, TCP и UDP/QUIC) |
 | `src/dns.c` | Парсинг DNS-ответов (A, AAAA, CNAME) |
 | `src/log.c` | Логирование (console/file/syslog/off) |
 | `src/util.c` | Хеш-таблица доменов, chunked pool, fork/exec |
@@ -129,10 +129,12 @@ DNS-ответ dnsmasq → клиент (любой интерфейс: br0/WG/V
 | `src/geodat.c` | Парсинг GeoIP/GeoSite .dat файлов (protobuf) |
 | `src/probe_tls.c` | Stateless парсер TLS ClientHello → SNI |
 | `src/probe_http.c` | Stateless парсер HTTP request → Host |
+| `src/probe_quic.c` | QUIC CRYPTO-walker: дешифровка Initial-пакета (v1/v2), HKDF + AES-128-CTR, ACK-frame skip → SNI |
+| `src/quic_crypto.c` | Pure-C SHA-256, HMAC-SHA256, HKDF-Expand-Label, AES-128-ECB/CTR (без AF_ALG, без libcrypto) |
 | `src/bogon.c` | Фильтр служебных IPv4/IPv6 диапазонов |
 | `src/nflog_capture.c` | NFLOG через raw NETLINK_NETFILTER (subsys ULOG=4, без libnetfilter_log) |
-| `src/l7_dispatch.c` | Fail-fast диспетчер пакетов → probe → reasm |
-| `src/l7_firewall.c` | WAN-резолв, init_module, iptables NFLOG-правила (FORWARD+OUTPUT) |
+| `src/l7_dispatch.c` | Fail-fast диспетчер пакетов → probe → reasm; UDP/443 ветка для QUIC |
+| `src/l7_firewall.c` | WAN-резолв, init_module, iptables NFLOG-правила (FORWARD+OUTPUT, TCP + UDP/QUIC) |
 | `src/tcp_reasm.c` | 5-tuple TCP-реассамблеция длинных ClientHello |
 | `include/hrneo.h` | Основные структуры, константы, inline `fnv1a_hash` |
 | `include/*.h` | Заголовочные файлы для каждого модуля |
@@ -168,11 +170,11 @@ DNS-ответ dnsmasq → клиент (любой интерфейс: br0/WG/V
 
 > В `hrneo.h` **НЕТ** `arena_t` / `ARENA_SIZE` — все временные буферы статические/на стеке.
 
-### `config_t` (27 полей)
+### `config_t` (28 полей)
 
 См. `src/params.c` и `docs/HRNEO.CONF.md`. Поля:
 
-`auto_start`, `watchlist_path`, `clear_ipset`, `cidr_enabled`, `cidr_file_path`, `ipset_enable_timeout`, `ipset_timeout`, `log_level`, `log_file_path`, `direct_route_enabled` (default 1), `interface_fwmark_start` (12289), `interface_table_start` (301), `global_routing`, `conntrack_flush` (1), `ipset_maxelem` (262144), `geo_ip_files[16][512]`+counter, `geo_site_files[16][512]`+counter, `policy_order[64][64]`+counter, `l7_capture_enabled` (0), `l7_nflog_group` (210), `l7_enable_tls` (1), `l7_enable_http` (1), `l7_connbytes_max` (8), `l7_wan_interface[32]`, `l7_tcp_reasm_enabled` (1), `l7_tcp_reasm_max_entries` (256), `l7_tcp_reasm_ttl_sec` (5).
+`auto_start`, `watchlist_path`, `clear_ipset`, `cidr_enabled`, `cidr_file_path`, `ipset_enable_timeout`, `ipset_timeout`, `log_level`, `log_file_path`, `direct_route_enabled` (default 1), `interface_fwmark_start` (12289), `interface_table_start` (301), `global_routing`, `conntrack_flush` (1), `ipset_maxelem` (262144), `geo_ip_files[16][512]`+counter, `geo_site_files[16][512]`+counter, `policy_order[64][64]`+counter, `l7_capture_enabled` (0), `l7_nflog_group` (210), `l7_enable_tls` (1), `l7_enable_http` (1), `l7_connbytes_max` (8), `l7_wan_interface[32]`, `l7_tcp_reasm_enabled` (1), `l7_tcp_reasm_max_entries` (256), `l7_tcp_reasm_ttl_sec` (5), `l7_enable_quic` (1).
 
 ### Глобальные переменные `main.c`
 
@@ -222,7 +224,7 @@ int                     g_reasm_active;
 20. `apply_unified_connmark_rules()`
 21. Если `conntrack_flush` — `conntrack_mgr_init()` (при ошибке flush отключается)
 22. `pkt_capture_init()` — два `AF_PACKET SOCK_DGRAM/ETH_P_ALL` сокета (`fd4`, `fd6`)
-23. Если `l7_capture_enabled`: `l7_firewall_resolve_wan` (при неудаче — L7 отключается с `LOG_WARN`, DNS-only); `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`; при неудаче — L7 отключается, DNS-only, **без fallback**). Иначе: `l7_firewall_load_kmod("xt_connbytes")`; `l7_dispatch_set_enable`; при `l7_tcp_reasm_enabled` — `tcp_reasm_init` + `l7_dispatch_set_reasm` (`g_reasm_active=1`); `nflog_capture_init`; `l7_firewall_install` (NFLOG в `mangle/FORWARD`+`OUTPUT` для TCP 443/80). `g_l7_active=1` при успехе
+23. Если `l7_capture_enabled`: `l7_firewall_resolve_wan` (при неудаче — L7 отключается с `LOG_WARN`, DNS-only); `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`; при неудаче — L7 отключается, DNS-only, **без fallback**). Иначе: `l7_firewall_load_kmod("xt_connbytes")`; `l7_dispatch_set_enable` (с флагами tls/http/quic); при `l7_tcp_reasm_enabled` — `tcp_reasm_init` + `l7_dispatch_set_reasm` (`g_reasm_active=1`); `nflog_capture_init`; `l7_firewall_install` (NFLOG в `mangle/FORWARD`+`OUTPUT` для TCP 443/80 и при `l7_enable_quic` — UDP 443 с `--length 1200:`). `g_l7_active=1` при успехе
 24. `signal_mgr_init()` — `sigprocmask` + `signalfd` + `timerfd`
 25. `epoll_create1()` — регистрация `cap.fd4`, `cap.fd6`, `signals.sig_fd`, `signals.timer_fd`; при `g_l7_active` — `nflog_fd`; при `g_reasm_active` — `reasm_gc_fd` (`timerfd` 1s)
 26. Основной цикл `epoll_wait` (`events[8]`)
@@ -964,7 +966,7 @@ hrneo взаимодействует с роутером Keenetic **исключ
 Удаляет ровно одну запись по известному 5-tuple `l7_conn_t`, **без DUMP таблицы** (O(1)). Строит `IPCTNL_MSG_CT_DELETE` через `m->del_fd` с собранным вручную `CTA_TUPLE_ORIG`:
 
 - `CTA_TUPLE_IP` (nested): `CTA_IPV4_SRC`/`CTA_IPV6_SRC` = `client_ip`, `CTA_IPV4_DST`/`CTA_IPV6_DST` = `server_ip` (направление original = клиент→сервер, до SNAT — NFLOG-хук стоит на `FORWARD`+`OUTPUT`);
-- `CTA_TUPLE_PROTO` (nested): `CTA_PROTO_NUM`=`IPPROTO_TCP`, `CTA_PROTO_SRC_PORT`=`htons(client_port)`, `CTA_PROTO_DST_PORT`=`htons(server_port)`.
+- `CTA_TUPLE_PROTO` (nested): `CTA_PROTO_NUM`=`c->proto` (IPPROTO_TCP для TLS/HTTP, IPPROTO_UDP для QUIC), `CTA_PROTO_SRC_PORT`=`htons(client_port)`, `CTA_PROTO_DST_PORT`=`htons(server_port)`.
 
 Хелперы построения nested-атрибутов: `ct_put_attr` / `ct_nest_begin` / `ct_nest_end` (флаг `NLA_F_NESTED`). На успех (`nlmsgerr.error==0`) — `LOG_DEBUG "conntrack: deleted L7 conn (family N)"`; запись не найдена (`-ENOENT`) → молча `0`. Удаление коллатерально не затрагивает другие соединения к тому же IP (в отличие от DUMP-по-dst в DNS-канале).
 
@@ -1003,7 +1005,7 @@ hrneo взаимодействует с роутером Keenetic **исключ
 
 ## 16. Система сборки: Makefile
 
-**Версия:** 3.12.1-1
+**Версия:** 3.14.0-1
 **Язык:** C (без CGO, без внешних библиотек)
 
 ### Кросс-компиляция
@@ -1027,7 +1029,7 @@ hrneo взаимодействует с роутером Keenetic **исключ
 
 **Линковка:** `-Wl,--gc-sections -s`; static: `-static -static-libgcc`. Макрос `VERSION` передаётся через `-DVERSION`.
 
-23 исходных файла (`src/*.c`), заголовочные в `include/`. Никаких `LIBS`/`LDFLAGS` для L7 — `NFLOG` через стандартный kernel-заголовок `<linux/netfilter/nfnetlink.h>` (формат сообщений `NFULNL_*` задан локально в `nflog_capture.c`).
+25 исходных файлов (`src/*.c`), заголовочные в `include/`. Никаких `LIBS`/`LDFLAGS` для L7 — `NFLOG` через стандартный kernel-заголовок `<linux/netfilter/nfnetlink.h>` (формат сообщений `NFULNL_*` задан локально в `nflog_capture.c`). Криптография QUIC (`quic_crypto.c`) — pure-C целочисленная арифметика, MIPS soft-float safe.
 
 ### Целевые платформы
 
@@ -1051,12 +1053,13 @@ hrneo взаимодействует с роутером Keenetic **исключ
 
 ---
 
-## 18. L7-перехват: TLS SNI / HTTP Host / TCP-реассамблеция
+## 18. L7-перехват: TLS SNI / HTTP Host / QUIC Initial / TCP-реассамблеция
 
-Второй источник имён хостов параллельно DNS-каналу. По умолчанию **выключен** (`l7CaptureEnabled=false`); включается `l7CaptureEnabled=true`. Закрывает слепые зоны DNS-only схемы: клиенты с DoH/DoT/DoQ, hardcoded-IP TLS, легаси-HTTP, тёплый DNS-кэш устройства.
+Второй источник имён хостов параллельно DNS-каналу. По умолчанию **выключен** (`l7CaptureEnabled=false`); включается `l7CaptureEnabled=true`. Закрывает слепые зоны DNS-only схемы: клиенты с DoH/DoT/DoQ, hardcoded-IP TLS, легаси-HTTP, тёплый DNS-кэш устройства, QUIC/HTTP-3.
 
-### 18.1 Цепочка
+### 18.1 Цепочки
 
+**TLS/HTTP (TCP):**
 ```
 [Клиент LAN→WAN TCP 443/80]
     → iptables/ip6tables mangle/FORWARD + mangle/OUTPUT -o WAN -p tcp --dport 443|80
@@ -1066,7 +1069,23 @@ hrneo взаимодействует с роутером Keenetic **исключ
     → probe_tls/probe_http (stateless парсеры) + tcp_reasm (фаза 2)
     → bogon_check → process_hostname_event_l7 → общий путь DNS-канала
       (match_domain_with_cname → ipset_add_batch; полный conntrack-DUMP НЕ вызывается — L7 передаёт allow_conntrack_flush=0)
-    → при первом добавлении IP (и ConntrackFlush=true): conntrack_delete_conn → точечный DELETE по 5-tuple (реконнект через политику)
+    → при первом добавлении IP (и ConntrackFlush=true): conntrack_delete_conn(proto=TCP) → точечный DELETE по 5-tuple (реконнект через политику)
+```
+
+**QUIC (UDP):**
+```
+[Клиент LAN→WAN UDP/443, пакет ≥ 1200 байт]
+    → iptables/ip6tables mangle/FORWARD + mangle/OUTPUT -o WAN -p udp --dport 443
+      -m length --length 1200: -j NFLOG --nflog-group G
+    → nflog_capture → l7_dispatch_packet (fail-fast IP/UDP/dport)
+    → quic_extract_sni: Long Header detect → версия v1/v2 → Initial-тип
+      → DCID → HKDF-Extract(salt, DCID) → client_secret → key/iv/hp
+      → header protection removal (AES-128-ECB(hp, sample)) → PN unmask
+      → payload decrypt (AES-128-CTR, nonce=iv XOR pn, ctr_start=2)
+      → frame walker: PADDING/PING skip, ACK/ACK_ECN full parse (ACK-frame skip)
+      → CRYPTO frame (offset=0) → fake TLS record → tls_extract_sni
+    → bogon_check → process_hostname_event_l7(tag="QUIC-SNI")
+    → при первом добавлении IP (и ConntrackFlush=true): conntrack_delete_conn(proto=UDP) → точечный DELETE по 5-tuple UDP
 ```
 
 `NFLOG` — **нетерминирующая** цель: пакет копируется в netlink-группу и
@@ -1075,16 +1094,18 @@ hrneo взаимодействует с роутером Keenetic **исключ
 NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они работают на той же машине
 без конфликта.
 
-Логи различают источник тегом: `[DNS]` / `[TLS-SNI]` / `[HTTP-Host]`.
+Логи различают источник тегом: `[DNS]` / `[TLS-SNI]` / `[HTTP-Host]` / `[QUIC-SNI]`.
 
 ### 18.2 Модули
 
 - **`src/probe_tls.c`:** `tls_quick_check` (`d[0]=0x16, d[1]=0x03, d[2]<=0x03, d[5]=0x01`), `tls_extract_sni` (record→handshake→ext→SNI type 0, partial-OK, lowercase).
 - **`src/probe_http.c`:** case-insensitive `"\nHost:"`, порт обрезается, IPv6-литерал `[::1]` поддержан.
+- **`src/probe_quic.c`:** QUIC CRYPTO-walker для QUIC v1 (RFC 9001) и v2 (RFC 9369). Long Header detect: бит `0xC0`, версия `0x00000001`/`0x6b3343cf`. Initial-тип: `(pkt[0]&0x30)==0x00` (v1) или `==0x10` (v2). HKDF-цепочка: `initial_secret=HKDF-Extract(salt, DCID)` → `client_secret=HKDF-Expand-Label(is, "client in", 32)` → `key`(16B)/`iv`(12B)/`hp`(16B). Header protection: `mask=AES-128-ECB(hp, sample[pn_offset+4:+20])`, first_byte `&=0x0F` (Long Header), PN-байты XOR mask[1..pn_len]. Payload: AES-128-CTR `nonce=iv XOR pn_be` с `ctr_start=2` (GCM-конвенция). Frame walker: PADDING(0x00)/PING(0x01) skip; ACK(0x02)/ACK_ECN(0x03) — полный разбор через `read_varint` (largest_ack, delay, range_count, first_range, alt-ranges, ECN counts) вместо bail — **ключевое отличие от netwatch**; CRYPTO(0x06) offset==0 → fake TLS record `0x16 0x03 0x01 len[2]` → `tls_extract_sni`. Статические буферы на стеке: `plain[2048]`, `rec[4096]`.
+- **`src/quic_crypto.c`:** SHA-256 (ctx: `state[8]`, `count`, `buf[64]`, `buf_len`; `sha256_compress` с полным schedule), HMAC-SHA256 (ipad/opad через два ctx-прохода), `hkdf_extract` = HMAC-SHA256(salt, IKM), `hkdf_expand_label` (HkdfLabel = `uint16(len)||uint8(6+label_len)||"tls13 "+label||0x00||0x01`). AES-128: 256-байтовый SBOX, 10-байтовый RCON, `aes_key_schedule` (44 слова, 11 round-keys), `aes_encrypt_block` (SubBytes+ShiftRows+MixColumns через `xtime`+AddRoundKey, column-major layout `s[row+4*col]`), `aes128_ecb_encrypt`, `aes128_ctr_xor` (single key schedule, big-endian counter bytes 12-15). Только целочисленные операции — MIPS soft-float safe.
 - **`src/bogon.c`:** служебные IPv4 (`0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16, >=224`) и IPv6 (`ff00::/8, fc00::/7, fe80::/10, ::, ::1, ::ffff:0:0/96`).
 - **`src/nflog_capture.c`:** свой NFLOG-клиент без `libnetfilter_log` (subsys `NFLOG_SUBSYS=4` = `NFNL_SUBSYS_ULOG`, `PF_BIND`→`CFG_CMD_BIND`→`CFG_MODE` с `copy_range`+`NLBUFSIZ`, `recv MSG_DONTWAIT`, **без verdict** — поток односторонний). `nflog_capture_t { fd, group, seq, portid, callback, user_data, recv_buf[NFLOG_RECV_BUF_SIZE=128KB] }`. Парсинг атрибута `NFULA_PAYLOAD`. Защита от `ENOBUFS` (`LOG_WARN`, копии теряются — мягкая деградация, трафик клиента не страдает).
-- **`src/l7_firewall.c`:** `l7_firewall_resolve_wan` (config + `stat /sys/class/net`, иначе `/proc/net/route Destination==00000000`), `l7_firewall_load_kmod` / `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`, нет `modprobe` на Keenetic), `install/remove` (`fork+exec iptables -w`, `-C ... || -A` для идемпотентности; `-D` в цикле). Правила ставятся в обе цепочки `FORWARD` (forwarded LAN→WAN) и `OUTPUT` (router-origin) × `iptables`/`ip6tables`. Для `dport 80` `connbytes_max` ужимается до `min(N, 4)`.
-- **`src/l7_dispatch.c`:** каскад + `try_tls_extract` (fast-path / reasm), `l7_dispatch_set_enable` / `set_reasm`. На hot path заполняет `l7_conn_t` (`include/l7_dispatch.h`: семейство, IP/порты клиента и сервера) и прокидывает его в `process_hostname_event_l7` — контекст нужен для точечного conntrack-DELETE по 5-tuple.
+- **`src/l7_firewall.c`:** `l7_firewall_resolve_wan` (config + `stat /sys/class/net`, иначе `/proc/net/route Destination==00000000`), `l7_firewall_load_kmod` / `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`, нет `modprobe` на Keenetic), `install/remove` (`fork+exec iptables -w`, `-C ... || -A` для идемпотентности; `-D` в цикле). Правила TCP ставятся в обе цепочки `FORWARD`+`OUTPUT` × `iptables`/`ip6tables`. При `l7_enable_quic` — дополнительно UDP/443 с `--length 1200:` (длина ≥1200 байт — признак QUIC Initial, обязательно padded по RFC 9000). Для `dport 80` `connbytes_max` ужимается до `min(N, 4)`.
+- **`src/l7_dispatch.c`:** UDP-ветка (до TCP-проверки): `l4_proto==IPPROTO_UDP`, `dport==443`, `quic_extract_sni`, `conn.proto=IPPROTO_UDP`; TCP-ветка: `conn.proto=IPPROTO_TCP` + `try_tls_extract` (fast-path/reasm). `l7_dispatch_set_enable(tls, http, quic)`. `l7_conn_t` (`include/l7_dispatch.h`): поля `family`, `proto`, `client_ip[16]`, `server_ip[16]`, `client_port`, `server_port` — контекст нужен для точечного conntrack-DELETE по 5-tuple с корректным proto.
 - **`src/tcp_reasm.c`** (фаза 2): 5-tuple хеш (`TCP_REASM_BUCKETS=64`), пул `calloc-on-init` (`l7TcpReasmMaxEntries × TCP_REASM_BUF_SIZE=16KB`), `start/feed/complete/get/destroy/gc`, seq-упорядочивание (gap→drop, retransmit→no-op), LRU-eviction (`evict_lru` возвращает освобождённый слот — без повторного скана пула), `timerfd` GC (TTL `l7TcpReasmTtlSec`).
 
 ### 18.3 Архитектурные решения
@@ -1099,7 +1120,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 ### 18.4 Известные gaps (НЕ реализовано)
 
-- **QUIC / HTTP-3 (UDP/443)** — значимо для Apple-устройств (Safari/iCloud/Push активно используют h3)
+- **QUIC v2 Initial type detection** — версия v2 определяется по `version==0x6b3343cf`; реализована. Не реализовано: Retry-пакеты (DCID меняется на Retry Token), QUIC over IPv6 Extension Headers с нестандартным next_header. На практике Initial packets без Retry — подавляющее большинство случаев.
 - **ECH (Encrypted ClientHello)** — нерешаемо без MITM
 - **iCloud Private Relay** — зашифрованный туннель, SNI релея (by design не наш)
 
@@ -1132,17 +1153,17 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 ## Резюме
 
-**HRNeo v3.12.1-1** — компактный однопоточный policy routing демон для роутеров Keenetic, написанный на чистом C.
+**HRNeo v3.14.0-1** — компактный однопоточный policy routing демон для роутеров Keenetic, написанный на чистом C.
 
 Два источника имён хостов:
 
 - **DNS-канал** — перехват DNS-ответов через AF_PACKET SOCK_DGRAM + L3-BPF, два fd; работает на интерфейсах любого типа (Ethernet, PPP, ARPHRD_NONE, туннели), поэтому ловит DNS LAN- и VPN-клиентов одним кодом
-- **L7-канал** — TLS SNI / HTTP Host исходящих соединений через собственный NFLOG-клиент на raw netlink (пассивное копирование, совместимо с zapret2/nfqws2), при `l7CaptureEnabled`; фаза 2 — TCP-реассамблеция фрагментированных ClientHello; при первом добавлении IP (и `ConntrackFlush=true`) триггернувшее соединение разрывается точечным удалением conntrack-записи по 5-tuple для мгновенного реконнекта через политику
+- **L7-канал** — TLS SNI / HTTP Host / QUIC Initial SNI исходящих соединений через собственный NFLOG-клиент на raw netlink (пассивное копирование, совместимо с zapret2/nfqws2), при `l7CaptureEnabled`; фаза 2 — TCP-реассамблеция фрагментированных ClientHello; QUIC: CRYPTO-walker с полной HKDF + AES-128-CTR дешифровкой Initial-пакета; при первом добавлении IP (и `ConntrackFlush=true`) триггернувшее соединение разрывается точечным удалением conntrack-записи по 5-tuple (TCP или UDP) для мгновенного реконнекта через политику
 
 Извлекает IP-адреса и добавляет в `ipset` через netlink, маркирует трафик в `iptables/mangle` для policy routing. Поддерживает маршрутизацию через политики Keenetic (mark через RCI API) и прямую на интерфейсы (`fwmark` + `ip rule` + `ip route`). GeoIP/GeoSite из `.dat` v2ray/xray с потоковым protobuf-парсингом.
 
-Event-driven архитектура на `epoll` (`cap.fd4` + `cap.fd6` + `signalfd` + `timerfd` + `nflog_fd` + `reasm_gc_fd`). QUIC/HTTP-3 — НЕ реализовано (gap для Apple/h3-трафика).
+Event-driven архитектура на `epoll` (`cap.fd4` + `cap.fd6` + `signalfd` + `timerfd` + `nflog_fd` + `reasm_gc_fd`).
 
-**27 параметров конфига**, все доступны через CLI-флаги (`--flag value`) + `--config <path>`, `--version`/`-v`, `--help`/`-h`, `--genconfig [path]`; приоритет: CLI > конфиг > дефолты. Описание параметров — единая таблица `PARAMS[]` в `src/params.c`, драйвит `config_read`, args, `--help`, `--genconfig`.
+**28 параметров конфига**, все доступны через CLI-флаги (`--flag value`) + `--config <path>`, `--version`/`-v`, `--help`/`-h`, `--genconfig [path]`; приоритет: CLI > конфиг > дефолты. Описание параметров — единая таблица `PARAMS[]` в `src/params.c`, драйвит `config_read`, args, `--help`, `--genconfig`.
 
 **Оптимизирован:** батчевый netlink (send N / recv N), хеш-таблица доменов 8192 бакетов с chunked pool (256КБ чанки), unified targets, batch `iptables-restore`, debounce сигналов, conntrack flush через netlink с long-lived сокетом, статическая аллокация в hot path, двунаправленный CNAME BFS, BPF-фильтрация в ядре, `ipset CREATE` с автоматическим запросом kernel-revision, контроль `maxelem` с автомиграцией oversized `geoip:TAG` в disabled-секцию `CIDRfile`.

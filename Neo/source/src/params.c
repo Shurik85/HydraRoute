@@ -147,6 +147,11 @@ const param_def_t PARAMS[] = {
       offsetof(config_t, l7_tcp_reasm_ttl_sec),   0,
       BIT(26), 0,            5,
       "<seconds>",               "TTL of incomplete reassembly entries",       "5"     },
+
+    { "l7EnableQUIC",         "--l7EnableQUIC",         PT_BOOL,
+      offsetof(config_t, l7_enable_quic),          0,
+      BIT(27), 0,            1,
+      "<true|false>",            "Parse QUIC Initial SNI on UDP dport 443",    "true"  },
 };
 
 const int PARAMS_COUNT = sizeof(PARAMS) / sizeof(PARAMS[0]);
