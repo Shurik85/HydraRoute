@@ -38,7 +38,6 @@ static int g_drm_active;
 static unified_target_t g_all_sorted[MAX_POLICY_ORDER + MAX_INTERFACES];
 static int g_all_sorted_count;
 static conntrack_mgr_t g_conntrack = { .fd = -1, .del_fd = -1 };
-static rci_client_t g_rci;
 static nflog_capture_t g_nflog;
 static int g_l7_active;
 static char g_l7_wan[MAX_INTERFACE_NAME];
@@ -159,7 +158,7 @@ static int process_hostname_event(const char *domain,
     }
 
     if (allow_conntrack_flush && g_config.conntrack_flush && all_new_count > 0) {
-        conntrack_flush_for_ips(&g_conntrack, all_new, all_new_count);
+        conntrack_flush_request(&g_conntrack, all_new, all_new_count);
     }
 
     return all_new_count;
@@ -251,7 +250,7 @@ static void perform_update(void) {
         drm_update_used_states(&g_drm);
         drm_handle_state_changes(&g_drm, (const char (*)[2][32])old_states, old_count);
     }
-    apply_unified_connmark_rules(&g_rci, g_all_sorted, g_all_sorted_count, g_config.global_routing);
+    apply_unified_connmark_rules(g_all_sorted, g_all_sorted_count, g_config.global_routing);
     if (g_config.l7_capture_enabled && g_l7_active && g_l7_wan[0])
         l7_firewall_install(&g_config, g_l7_wan);
     LOG_INFO("iptables updated");
@@ -415,15 +414,11 @@ int main(int argc, char *argv[]) {
             LOG_INFO("  [%d] %s (policy)", i, g_all_sorted[i].pair.ipv4);
     }
 
-    if (rci_client_init(&g_rci) != 0) {
-        goto cleanup;
-    }
-
-    rci_create_policies(&g_rci, (const char (*)[64])policy_names, policy_count);
+    rci_create_policies((const char (*)[64])policy_names, policy_count);
 
     if (ipset_manager_init(&g_ipset_mgr) != 0) {
         LOG_ERROR("Failed to init ipset manager");
-        goto cleanup_rci;
+        goto cleanup;
     }
 
     {
@@ -455,7 +450,7 @@ int main(int argc, char *argv[]) {
         drm_setup_all_routes(&g_drm);
     }
 
-    apply_unified_connmark_rules(&g_rci, g_all_sorted, g_all_sorted_count, g_config.global_routing);
+    apply_unified_connmark_rules(g_all_sorted, g_all_sorted_count, g_config.global_routing);
 
     if (g_config.conntrack_flush) {
         if (conntrack_mgr_init(&g_conntrack) != 0) {
@@ -542,6 +537,11 @@ int main(int argc, char *argv[]) {
     ev.data.fd = signals.timer_fd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, signals.timer_fd, &ev);
 
+    if (g_conntrack.fd >= 0) {
+        ev.data.fd = g_conntrack.fd;
+        epoll_ctl(epfd, EPOLL_CTL_ADD, g_conntrack.fd, &ev);
+    }
+
     int nflog_fd = -1;
     if (g_l7_active) {
         nflog_fd = nflog_capture_fd(&g_nflog);
@@ -582,6 +582,8 @@ int main(int argc, char *argv[]) {
                 pkt_capture_process(&cap, events[i].data.fd);
             } else if (g_l7_active && events[i].data.fd == nflog_fd) {
                 nflog_capture_process(&g_nflog);
+            } else if (g_conntrack.fd >= 0 && events[i].data.fd == g_conntrack.fd) {
+                conntrack_process(&g_conntrack);
             } else if (reasm_gc_fd >= 0 && events[i].data.fd == reasm_gc_fd) {
                 uint64_t exp;
                 ssize_t r = read(reasm_gc_fd, &exp, sizeof(exp));
@@ -652,9 +654,6 @@ cleanup_conntrack:
         cleanup_connmark_rules(cleanup_pairs, g_all_sorted_count);
     }
     ipset_manager_close(&g_ipset_mgr);
-
-cleanup_rci:
-    rci_client_close(&g_rci);
 
 cleanup:
     if (g_all_targets) ht_destroy(g_all_targets);

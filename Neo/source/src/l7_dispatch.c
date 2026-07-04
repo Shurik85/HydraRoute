@@ -38,6 +38,13 @@ static void build_key(tcp_reasm_key_t *k, int family,
     k->dst_port = dport;
 }
 
+static void build_quic_key(tcp_reasm_key_t *k, int family,
+                           const uint8_t *saddr, const uint8_t *daddr,
+                           uint16_t sport, uint16_t dport) {
+    build_key(k, family, saddr, daddr, sport, dport);
+    k->family |= 0x80;
+}
+
 static void try_tls_extract(const uint8_t *payload, int payload_len,
                             uint32_t seq,
                             const tcp_reasm_key_t *key,
@@ -121,7 +128,36 @@ void l7_dispatch_packet(const uint8_t *pkt, int len,
         if (quic_len < 20) return;
 
         char host[256];
-        if (!quic_extract_sni(quic, quic_len, host, sizeof(host))) return;
+        quic_crypto_frag_t frag = { 0 };
+        if (quic_extract_sni(quic, quic_len, host, sizeof(host), &frag) != 1) {
+            if (!frag.found || !g_reasm_ref) return;
+
+            tcp_reasm_key_t key;
+            build_quic_key(&key, dst_family, saddr, daddr, sport, dport);
+
+            if (frag.offset == 0) {
+                if (frag.len < 4) return;
+                size_t total = 4 + ((size_t)frag.data[1] << 16 |
+                                    (size_t)frag.data[2] << 8  |
+                                    (size_t)frag.data[3]);
+                if (tcp_reasm_start(g_reasm_ref, &key, frag.data, frag.len,
+                                    total, 0) != 0)
+                    return;
+            } else {
+                if (!tcp_reasm_lookup(g_reasm_ref, &key)) return;
+                if (tcp_reasm_feed(g_reasm_ref, &key, frag.data, frag.len,
+                                   (uint32_t)frag.offset) != 1)
+                    return;
+            }
+
+            if (!tcp_reasm_complete(g_reasm_ref, &key)) return;
+
+            const uint8_t *full; size_t flen;
+            int ok = tcp_reasm_get(g_reasm_ref, &key, &full, &flen) == 0 &&
+                     quic_ch_to_sni(full, flen, host, sizeof(host));
+            tcp_reasm_destroy(g_reasm_ref, &key);
+            if (!ok) return;
+        }
         if (bogon_check(daddr, dst_family)) return;
 
         l7_conn_t conn;

@@ -6,6 +6,7 @@
 
 #define QUIC_V1 0x00000001u
 #define QUIC_V2 0x6b3343cfu
+#define QUIC_CH_REC_MAX 8192
 
 static const uint8_t SALT_V1[20] = {
     0x38,0x76,0x2c,0xf7,0xf5,0x59,0x34,0xb3,0x4d,0x17,
@@ -28,7 +29,19 @@ static int read_varint(const uint8_t *buf, size_t len, size_t *pos, uint64_t *va
     return 1;
 }
 
-int quic_extract_sni(const uint8_t *pkt, int pkt_len, char *host, size_t host_size) {
+int quic_ch_to_sni(const uint8_t *ch, size_t ch_len, char *host, size_t host_size) {
+    if (ch_len < 6 || ch_len + 5 > QUIC_CH_REC_MAX) return 0;
+    static uint8_t rec[QUIC_CH_REC_MAX];
+    rec[0] = 0x16; rec[1] = 0x03; rec[2] = 0x01;
+    rec[3] = (uint8_t)(ch_len >> 8);
+    rec[4] = (uint8_t)(ch_len);
+    memcpy(rec + 5, ch, ch_len);
+    return tls_extract_sni(rec, ch_len + 5, host, host_size);
+}
+
+int quic_extract_sni(const uint8_t *pkt, int pkt_len, char *host, size_t host_size,
+                     quic_crypto_frag_t *frag) {
+    if (frag) frag->found = 0;
     if (pkt_len < 20) return 0;
     if ((pkt[0] & 0xC0) != 0xC0) return 0;
 
@@ -143,23 +156,17 @@ int quic_extract_sni(const uint8_t *pkt, int pkt_len, char *host, size_t host_si
             if (!read_varint(plain, plain_len, &fpos, &length)) break;
             if (fpos + (size_t)length > plain_len) break;
 
-            if (offset == 0 && length >= 6) {
-                uint8_t fake[5];
-                fake[0] = 0x16; fake[1] = 0x03; fake[2] = 0x01;
-                fake[3] = (uint8_t)(length >> 8);
-                fake[4] = (uint8_t)(length);
-
-                const uint8_t *ch_data = plain + fpos;
-                size_t ch_len = (size_t)length;
-
-                if (ch_len + 5 <= 4096) {
-                    static uint8_t rec[4096];
-                    memcpy(rec, fake, 5);
-                    memcpy(rec + 5, ch_data, ch_len);
-                    if (tls_extract_sni(rec, ch_len + 5, host, host_size))
-                        return 1;
-                }
+            if (frag && !frag->found) {
+                frag->found  = 1;
+                frag->offset = offset;
+                frag->data   = plain + fpos;
+                frag->len    = (size_t)length;
             }
+
+            if (offset == 0 &&
+                quic_ch_to_sni(plain + fpos, (size_t)length, host, host_size))
+                return 1;
+
             fpos += (size_t)length;
             continue;
         }

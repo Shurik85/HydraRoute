@@ -9,28 +9,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-static int rci_save_config(rci_client_t *c);
-
-int rci_client_init(rci_client_t *c) {
-    c->raw_buf = malloc(RCI_MAX_RESPONSE + 4096);
-    c->response_buf = malloc(RCI_MAX_RESPONSE);
-    if (!c->raw_buf || !c->response_buf) {
-        free(c->raw_buf);
-        free(c->response_buf);
-        c->raw_buf = NULL;
-        c->response_buf = NULL;
-        LOG_ERROR("RCI client: failed to allocate buffers");
-        return -1;
-    }
-    return 0;
-}
-
-void rci_client_close(rci_client_t *c) {
-    free(c->raw_buf);
-    free(c->response_buf);
-    c->raw_buf = NULL;
-    c->response_buf = NULL;
-}
+#define RCI_RAW_MAX    32768
+#define RCI_HTTP_FAIL  (-2)
 
 static int rci_connect(void) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -53,8 +33,7 @@ static int rci_connect(void) {
     return fd;
 }
 
-static int rci_request(rci_client_t *c,
-                       const char *method, const char *path,
+static int rci_request(const char *method, const char *path,
                        const char *body, int body_len,
                        char *response, int response_max) {
     int fd = rci_connect();
@@ -95,11 +74,9 @@ static int rci_request(rci_client_t *c,
         }
     }
 
-    char *raw = c->raw_buf;
-    int raw_capacity = RCI_MAX_RESPONSE + 4096;
-
+    static char raw[RCI_RAW_MAX];
     int total = 0;
-    int max_raw = raw_capacity - 1;
+    int max_raw = (int)sizeof(raw) - 1;
     while (total < max_raw) {
         int n = recv(fd, raw + total, max_raw - total, 0);
         if (n <= 0) break;
@@ -114,10 +91,8 @@ static int rci_request(rci_client_t *c,
 
     if (strncmp(raw, "HTTP/", 5) != 0) return -1;
     char *status = strchr(raw, ' ');
-    if (!status || atoi(status + 1) != 200) {
-        LOG_ERROR("RCI response status: %d", status ? atoi(status + 1) : 0);
-        return -1;
-    }
+    if (!status || atoi(status + 1) != 200)
+        return RCI_HTTP_FAIL;
 
     int response_len = total - (int)(body_start - raw);
     if (response_len > response_max - 1) response_len = response_max - 1;
@@ -127,94 +102,37 @@ static int rci_request(rci_client_t *c,
     return response_len;
 }
 
-static const char *find_matching_brace(const char *open_brace) {
-    int depth = 0;
-    int in_string = 0;
-    for (const char *c = open_brace; *c; c++) {
-        if (*c == '"' && (c == open_brace || *(c - 1) != '\\')) {
-            in_string = !in_string;
-            continue;
-        }
-        if (in_string) continue;
-        if (*c == '{') depth++;
-        else if (*c == '}') {
-            depth--;
-            if (depth == 0) return c;
-        }
-    }
-    return NULL;
+static int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
+    char path[160];
+    snprintf(path, sizeof(path), "/rci/show/ip/policy/%s/mark", name);
+
+    char response[256];
+    int len = rci_request("GET", path, NULL, 0, response, sizeof(response));
+    if (len == -1) return -1;
+    if (len < 0) return 0;
+
+    const char *val = strchr(response, '"');
+    if (!val) return 0;
+    val++;
+    const char *end = strchr(val, '"');
+    if (!end) return 0;
+
+    if (val[0] == '0' && (val[1] == 'x' || val[1] == 'X'))
+        val += 2;
+    int n = (int)(end - val);
+    if (n <= 0) return 0;
+    if (n > mark_size - 1) n = mark_size - 1;
+    memcpy(mark, val, n);
+    mark[n] = '\0';
+
+    LOG_DEBUG("RCI policy: %s mark=0x%s", name, mark);
+    return 1;
 }
 
-static int rci_get_policies(rci_client_t *c, policy_mark_t *policies, int max_policies) {
-    char *response = c->response_buf;
-
-    int len = rci_request(c, "GET", "/rci/show/ip/policy/",
-                          NULL, 0, response, RCI_MAX_RESPONSE);
-    if (len <= 0) return -1;
-
-    int count = 0;
-
-    const char *root_brace = strchr(response, '{');
-    if (!root_brace) return 0;
-    const char *p = root_brace + 1;
-
-    while (*p && count < max_policies) {
-        const char *key_start = strchr(p, '"');
-        if (!key_start) break;
-        key_start++;
-        const char *key_end = strchr(key_start, '"');
-        if (!key_end) break;
-
-        int key_len = (int)(key_end - key_start);
-
-        const char *brace = strchr(key_end + 1, '{');
-        if (!brace) break;
-        const char *end_brace = find_matching_brace(brace);
-        if (!end_brace) break;
-
-        if (key_len <= 0 || key_len >= MAX_POLICY_NAME) {
-            p = end_brace + 1;
-            continue;
-        }
-
-        const char *mark_key = strstr(brace, "\"mark\"");
-        if (!mark_key || mark_key > end_brace) {
-            p = end_brace + 1;
-            continue;
-        }
-
-        const char *colon = strchr(mark_key + 6, ':');
-        if (!colon || colon > end_brace) { p = end_brace + 1; continue; }
-
-        const char *val_start = strchr(colon, '"');
-        if (!val_start || val_start > end_brace) { p = end_brace + 1; continue; }
-        val_start++;
-        const char *val_end = strchr(val_start, '"');
-        if (!val_end || val_end > end_brace) { p = end_brace + 1; continue; }
-
-        memcpy(policies[count].name, key_start, key_len);
-        policies[count].name[key_len] = '\0';
-
-        const char *mark_val = val_start;
-        if (mark_val[0] == '0' && (mark_val[1] == 'x' || mark_val[1] == 'X'))
-            mark_val += 2;
-        int mark_len = (int)(val_end - mark_val);
-        if (mark_len >= 16) mark_len = 15;
-        memcpy(policies[count].mark, mark_val, mark_len);
-        policies[count].mark[mark_len] = '\0';
-
-        LOG_DEBUG("RCI policy: %s mark=0x%s", policies[count].name, policies[count].mark);
-        count++;
-        p = end_brace + 1;
-    }
-
-    return count;
-}
-
-int rci_get_policies_with_retry(rci_client_t *c, policy_mark_t *policies, int max_policies) {
+int rci_get_policy_mark_with_retry(const char *name, char *mark, int mark_size) {
     for (int attempt = 0; attempt < POLICY_API_MAX_RETRIES; attempt++) {
-        int count = rci_get_policies(c, policies, max_policies);
-        if (count >= 0) return count;
+        int r = rci_get_policy_mark(name, mark, mark_size);
+        if (r >= 0) return r;
         if (attempt < POLICY_API_MAX_RETRIES - 1) {
             LOG_WARN("Policy API attempt %d/%d failed, retrying in %ds...",
                      attempt + 1, POLICY_API_MAX_RETRIES, POLICY_API_RETRY_DELAY);
@@ -225,37 +143,24 @@ int rci_get_policies_with_retry(rci_client_t *c, policy_mark_t *policies, int ma
     return -1;
 }
 
-int rci_create_policies(rci_client_t *c, const char (*names)[64], int count) {
+int rci_create_policies(const char (*names)[64], int count) {
     if (count == 0) return 0;
 
-    char body[4096];
-    int off = 0;
-    off += snprintf(body + off, sizeof(body) - off, "[");
+    char body[8192];
+    int off = snprintf(body, sizeof(body), "[");
     for (int i = 0; i < count; i++) {
-        if (i > 0) off += snprintf(body + off, sizeof(body) - off, ",");
         off += snprintf(body + off, sizeof(body) - off,
-                        "{\"parse\":\"ip policy %s\"}", names[i]);
+                        "{\"parse\":\"ip policy %s\"},", names[i]);
     }
-    off += snprintf(body + off, sizeof(body) - off, "]");
+    off += snprintf(body + off, sizeof(body) - off,
+                    "{\"system\":{\"configuration\":{\"save\":true}}}]");
 
-    char response[1024];
-    int ret = rci_request(c, "POST", "/rci/", body, off, response, sizeof(response));
+    char response[4096];
+    int ret = rci_request("POST", "/rci/", body, off, response, sizeof(response));
     if (ret < 0) {
         LOG_WARN("Failed to create policies via RCI");
-    } else {
-        LOG_INFO("Policy creation commands executed");
+        return -1;
     }
-
-    rci_save_config(c);
-    return ret >= 0 ? 0 : -1;
-}
-
-static int rci_save_config(rci_client_t *c) {
-    const char *body = "{\"system\":{\"configuration\":{\"save\":true}}}";
-    char response[1024];
-    int ret = rci_request(c, "POST", "/rci/", body, strlen(body), response, sizeof(response));
-    if (ret < 0) {
-        LOG_ERROR("Failed to save RCI configuration");
-    }
-    return ret >= 0 ? 0 : -1;
+    LOG_INFO("Policy creation commands executed");
+    return 0;
 }

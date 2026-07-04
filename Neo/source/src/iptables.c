@@ -109,33 +109,27 @@ typedef struct {
     int  rule_count;
 } connmark_family_t;
 
-int apply_unified_connmark_rules(rci_client_t *rci, const unified_target_t *targets,
+int apply_unified_connmark_rules(const unified_target_t *targets,
                                  int count, int global_routing) {
     char ipv6_net[64];
     get_br0_global_ipv6(ipv6_net, sizeof(ipv6_net));
 
-    policy_mark_t policies[MAX_POLICY_ORDER];
-    int policy_count = -1;
+    char policy_marks[MAX_POLICY_ORDER + MAX_INTERFACES][16];
 
     for (int attempt = 0; ; attempt++) {
-        policy_count = rci_get_policies_with_retry(rci, policies, MAX_POLICY_ORDER);
-        if (policy_count < 0) {
-            LOG_ERROR("Failed to get policy data from RCI");
-            return -1;
-        }
-
         int missing = 0;
         for (int i = 0; i < count; i++) {
+            policy_marks[i][0] = '\0';
             if (targets[i].is_interface) continue;
-            int found = 0;
-            for (int p = 0; p < policy_count; p++) {
-                if (strcmp(policies[p].name, targets[i].pair.ipv4) == 0 &&
-                    policies[p].mark[0] != '\0') {
-                    found = 1;
-                    break;
-                }
+
+            int r = rci_get_policy_mark_with_retry(targets[i].pair.ipv4,
+                                                   policy_marks[i],
+                                                   sizeof(policy_marks[i]));
+            if (r < 0) {
+                LOG_ERROR("Failed to get policy data from RCI");
+                return -1;
             }
-            if (!found) {
+            if (r == 0) {
                 LOG_WARN("Policy %s has no mark ID yet", targets[i].pair.ipv4);
                 missing = 1;
             }
@@ -167,16 +161,11 @@ int apply_unified_connmark_rules(rci_client_t *rci, const unified_target_t *targ
         if (targets[i].is_interface) {
             snprintf(mark_hex, sizeof(mark_hex), "%x", targets[i].fwmark);
         } else {
-            for (int p = 0; p < policy_count; p++) {
-                if (strcmp(policies[p].name, targets[i].pair.ipv4) == 0) {
-                    strncpy(mark_hex, policies[p].mark, 15);
-                    break;
-                }
-            }
-            if (mark_hex[0] == '\0') {
+            if (policy_marks[i][0] == '\0') {
                 LOG_WARN("Policy %s has no mark ID, skipping", targets[i].pair.ipv4);
                 continue;
             }
+            strncpy(mark_hex, policy_marks[i], 15);
         }
 
         for (int fi = 0; fi < 2; fi++) {

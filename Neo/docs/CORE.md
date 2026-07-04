@@ -1,17 +1,17 @@
 # HRNeo — техническая документация кодовой базы
 
-Исходный код HRNeo (HydraRoute Neo) v3.14.0-1: архитектура, модули, потоки данных, оптимизации.
+Исходный код HRNeo (HydraRoute Neo) v3.15.0-1: архитектура, модули, потоки данных, оптимизации.
 
 ---
 
 ## 1. Общая архитектура и принцип работы
 
-HRNeo — демон для policy routing на роутерах Keenetic (Entware). Чистый C (без CGO, без внешних библиотек кроме libc и Linux API), единый статически скомпилированный бинарник. Версия 3.12.1-1.
+HRNeo — демон для policy routing на роутерах Keenetic (Entware). Чистый C (без CGO, без внешних библиотек кроме libc и Linux API), единый статически скомпилированный бинарник.
 
 ### Два независимых источника имён хостов
 
 - **DNS-канал** (всегда): перехват DNS-ответов dnsmasq через AF_PACKET SOCK_DGRAM + L3-BPF. Работает на интерфейсах любого типа — Ethernet, PPP, ARPHRD_NONE (WireGuard, VPN-сервер, IPsec, туннели). Ловит DNS и LAN-, и VPN-клиентов.
-- **L7-канал** (опционально, `l7CaptureEnabled`): перехват TLS SNI / HTTP Host / QUIC Initial SNI исходящих соединений через NFLOG (пассивное копирование пакета, нетерминирующая цель). Фаза 2 — TCP-реассамблеция длинных ClientHello. QUIC — CRYPTO-walker с дешифровкой Initial-пакета. Подробно — раздел [18](#18-l7-перехват-tls-sni--http-host--tcp-реассамблеция).
+- **L7-канал** (опционально, `l7CaptureEnabled`): перехват TLS SNI / HTTP Host / QUIC Initial SNI исходящих соединений через NFLOG (пассивное копирование пакета, нетерминирующая цель). Фаза 2 — реассамблеция длинных ClientHello: TCP (по seq) и QUIC CRYPTO-фрагментов многодатаграммного Initial (MLKEM/Kyber), обе поверх общего пула `tcp_reasm`. QUIC — CRYPTO-walker с дешифровкой Initial-пакета. Подробно — раздел [18](#18-l7-перехват-tls-sni--http-host--tcp-реассамблеция).
 
 ### Принцип работы (пошагово)
 
@@ -38,7 +38,7 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
      ...
    ```
 
-7. **Создание/проверка политик Keenetic через RCI** (`rci_create_policies`): hrneo формирует `POST /rci/ HTTP/1.0` с JSON-массивом `[{"parse":"ip policy <name1>"}, {"parse":"ip policy <name2>"}, ...]` и отправляет на `127.0.0.1:79`. Команда `parse` эквивалентна вводу `ip policy <name>` в CLI Keenetic — существующие политики не трогает, отсутствующие создаются пустыми (без VPN-интерфейсов; их администратор присвоит через веб-интерфейс роутера Keenetic). После — безусловный `POST /rci/ {"system":{"configuration":{"save":true}}}` (сохранение в startup-config). Интерфейсы из `iface_names[]` в RCI не отправляются — для них политики Keenetic не нужны. Лог: `[INFO] Policy creation commands executed`. Подробнее — раздел [13](#13-rci-remote-configuration-interface-keenetic-srcrcic).
+7. **Создание/проверка политик Keenetic через RCI** (`rci_create_policies`): hrneo формирует `POST /rci/ HTTP/1.0` с JSON-массивом `[{"parse":"ip policy <name1>"}, ..., {"system":{"configuration":{"save":true}}}]` и отправляет на `127.0.0.1:79` — создание политик и сохранение startup-config одним запросом. Команда `parse` эквивалентна вводу `ip policy <name>` в CLI Keenetic — существующие политики не трогает, отсутствующие создаются пустыми (без VPN-интерфейсов; их администратор присвоит через веб-интерфейс роутера Keenetic). Интерфейсы из `iface_names[]` в RCI не отправляются — для них политики Keenetic не нужны. Лог: `[INFO] Policy creation commands executed`. Подробнее — раздел [13](#13-rci-remote-configuration-interface-keenetic-srcrcic).
 
 8. Создаются `ipset`-множества `hash:net` (IPv4 и IPv6 отдельно) для каждой цели (политика или интерфейс): по два сета на target — `<name>` (IPv4) и `<name>v6` (IPv6). Через netlink с `NLM_F_CREATE|NLM_F_EXCL`; существующие сеты не пересоздаются. Таймаут один на все сеты — поле `default_timeout` менеджера ipset (0 = без таймаута). При `clearIPSet=true` — `FLUSH` каждого сета.
 
@@ -56,9 +56,8 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
     `fwmark` и `table_id` уникальные, выделяются последовательно от `InterfaceFwMarkStart` (12289) и `InterfaceTableStart` (301).
 
 12. **Извлечение `markID` политик через RCI** + создание `CONNMARK`-правил `iptables` (`apply_unified_connmark_rules`):
-    - `GET /rci/show/ip/policy/` возвращает JSON `{"<Name>":{"mark":"0xNN", ...}, ...}`
-    - hrneo вручную парсит ответ (`find_matching_brace` + `strstr "mark"`), извлекает hex-значение `markID` для каждой политики, снимает префикс `0x`. Лог при `log=console/file`: `[DEBUG] RCI policy: HydraRoute mark=0x21`
-    - Двухуровневая retry-защита: `rci_get_policies_with_retry` (до 5 попыток × 3с) от сетевых ошибок; внутренний loop (до 5 попыток × 4с) от свежесозданных политик без `markID` (роутер назначает его не сразу после `parse`)
+    - Для каждой цели-политики точечный `GET /rci/show/ip/policy/<Name>/mark` возвращает голое значение `"ffffaaa"` (~10 байт; HTTP 404 — политики нет). Полное дерево политик со всеми маршрутами не выкачивается, JSON-парсер не нужен — из ответа снимаются кавычки и префикс `0x`. Лог при `log=console/file`: `[DEBUG] RCI policy: HydraRoute mark=0xffffaaa`
+    - Двухуровневая retry-защита: `rci_get_policy_mark_with_retry` (до 5 попыток × 3с) от сетевых ошибок; внешний loop (до 5 попыток × 4с) от свежесозданных политик без `markID` (роутер назначает его не сразу после `parse`)
     - Для целей-интерфейсов `markID` не запрашивается — используется назначенный `fwmark`
     - Для каждой цели в порядке `g_all_sorted[]` формируется пара `CONNMARK`-правил в `mangle/PREROUTING`, через `iptables-restore --noflush` (один вызов на весь батч). Если у политики `mark` пустой после retry — `LOG_WARN "Policy %s has no mark ID, skipping"`, цель пропускается (`ipset` продолжит заполняться, но трафик не маркируется)
 
@@ -68,7 +67,7 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
 
 15. Основной epoll-цикл перехватывает DNS-ответы (`AF_PACKET`) и L7-пакеты (`NFLOG`), добавляет IP в `ipset` через netlink. Для L7-канала при **первом** добавлении IP (и при `ConntrackFlush=true`) триггернувшее соединение разрывается точечным удалением его conntrack-записи по полному 5-tuple (`conntrack_delete_conn`) — следующий пакет переоценивает `CONNMARK`-правила, а смена src/NAT через политику вынуждает легитимный реконнект по выбранному маршруту. Полный conntrack-DUMP (шаг 16) из L7-канала не выполняется — L7 использует точечный DELETE без сканирования таблицы.
 
-16. Если `ConntrackFlush=true` И IP добавлен в `ipset` впервые (`NLM_F_EXCL` вернул `err==0`, а не `IPSET_ERR_EXIST`), для каждого такого IP делается `conntrack`-DUMP с DELETE по совпадению dst-IP. Реальное удаление происходит только при наличии активной `conntrack`-записи к этому IP; если соединения к IP ещё нет — DUMP проходит вхолостую, DELETE не отправляется.
+16. Если `ConntrackFlush=true` И IP добавлен в `ipset` впервые (`NLM_F_EXCL` вернул `err==0`, а не `IPSET_ERR_EXIST`), IP попадает в pending-буфер `conntrack_flush_request` — conntrack-DUMP выполняется **асинхронно**: неблокирующий сокет `m->fd` зарегистрирован в том же epoll, чанки таблицы читаются между DNS-пакетами, DELETE по совпадению dst-IP уходит fire-and-forget. DNS-события никогда не ждут сканирования таблицы (при burst-резолвах ipset add всех доменов завершается до/независимо от DUMP'а), один DUMP обслуживает все накопленные IP. Реальное удаление происходит только при наличии активной `conntrack`-записи к IP; если соединения ещё нет — DUMP проходит вхолостую.
 
 17. Обрабатываются сигналы:
     - `SIGUSR1` — обновление состояния интерфейсов + пересоздание `CONNMARK`-правил (включая повторный `GET /rci/show/ip/policy/` для возможно изменившихся `markID`) + реинсталл L7-правил (idempotent через `iptables -C`). Debounce 5с через `timerfd`
@@ -98,7 +97,11 @@ DNS-ответ dnsmasq → клиент (любой интерфейс: br0/WG/V
 (ConntrackFlush=true && новые IP)
    |
    v
-[netlink: удаление conntrack-записей для новых IP (DUMP + DELETE if present)]
+[conntrack_flush_request: IP → pending-буфер, старт async DUMP]
+   |
+   v
+[epoll EPOLLIN на ct-fd → conntrack_process: чанки DUMP между DNS-пакетами,
+ DELETE (fire-and-forget) по совпадению dst-IP с pending]
 
 [Исходящий трафик клиента]
    → iptables/mangle PREROUTING
@@ -120,7 +123,7 @@ DNS-ответ dnsmasq → клиент (любой интерфейс: br0/WG/V
 | `src/args.c` | Парсинг CLI, наложение на config |
 | `src/params.c` | PARAMS[] — таблица описания параметров (single source of truth для config/args/help/genconfig) |
 | `src/ipset_nl.c` | Низкоуровневая работа с ipset через netlink |
-| `src/conntrack.c` | Сброс conntrack-записей через netlink: DUMP+DELETE по dst-IP (DNS-канал) и точечный DELETE по 5-tuple (L7-канал, TCP и UDP/QUIC) |
+| `src/conntrack.c` | Сброс conntrack-записей через netlink: асинхронный DUMP (epoll) + DELETE по dst-IP из pending-буфера (DNS-канал) и точечный DELETE по 5-tuple (L7-канал, TCP и UDP/QUIC) |
 | `src/dns.c` | Парсинг DNS-ответов (A, AAAA, CNAME) |
 | `src/log.c` | Логирование (console/file/syslog/off) |
 | `src/util.c` | Хеш-таблица доменов, chunked pool, fork/exec |
@@ -129,13 +132,13 @@ DNS-ответ dnsmasq → клиент (любой интерфейс: br0/WG/V
 | `src/geodat.c` | Парсинг GeoIP/GeoSite .dat файлов (protobuf) |
 | `src/probe_tls.c` | Stateless парсер TLS ClientHello → SNI |
 | `src/probe_http.c` | Stateless парсер HTTP request → Host |
-| `src/probe_quic.c` | QUIC CRYPTO-walker: дешифровка Initial-пакета (v1/v2), HKDF + AES-128-CTR, ACK-frame skip → SNI |
+| `src/probe_quic.c` | QUIC CRYPTO-walker: дешифровка Initial-пакета (v1/v2), HKDF + AES-128-CTR, ACK-frame skip → SNI; выдаёт CRYPTO-фрагмент для реассамблеции |
 | `src/quic_crypto.c` | Pure-C SHA-256, HMAC-SHA256, HKDF-Expand-Label, AES-128-ECB/CTR (без AF_ALG, без libcrypto) |
 | `src/bogon.c` | Фильтр служебных IPv4/IPv6 диапазонов |
 | `src/nflog_capture.c` | NFLOG через raw NETLINK_NETFILTER (subsys ULOG=4, без libnetfilter_log) |
 | `src/l7_dispatch.c` | Fail-fast диспетчер пакетов → probe → reasm; UDP/443 ветка для QUIC |
 | `src/l7_firewall.c` | WAN-резолв, init_module, iptables NFLOG-правила (FORWARD+OUTPUT, TCP + UDP/QUIC) |
-| `src/tcp_reasm.c` | 5-tuple TCP-реассамблеция длинных ClientHello |
+| `src/tcp_reasm.c` | 5-tuple реассамблеция длинных ClientHello: TCP-сегменты и QUIC CRYPTO-фрагменты (общий пул, ключи разделены битом family 0x80) |
 | `include/hrneo.h` | Основные структуры, константы, inline `fnv1a_hash` |
 | `include/*.h` | Заголовочные файлы для каждого модуля |
 | `Makefile` | Сборка для mipsel, mips, aarch64, native |
@@ -188,7 +191,6 @@ int                     g_drm_active;
 unified_target_t        g_all_sorted[MAX_POLICY_ORDER + MAX_INTERFACES];
 int                     g_all_sorted_count;
 conntrack_mgr_t         g_conntrack = { .fd = -1, .del_fd = -1 };
-rci_client_t            g_rci;
 nflog_capture_t         g_nflog;
 int                     g_l7_active;
 char                    g_l7_wan[MAX_INTERFACE_NAME];
@@ -215,20 +217,19 @@ int                     g_reasm_active;
 11. `sort_policies()` для `policy_names` с учётом `PolicyOrder`
 12. `g_all_sorted[]`: `all_names = policy_names + iface_names`, `sort_policies()` на объединении; `unified_target_t = {pair (ipv4/ipv6 имена), is_interface, fwmark}`
 13. `LOG_INFO "Target order (%d):"` — вывод порядка целей
-14. `rci_client_init(&g_rci)` — выделение `raw_buf` + `response_buf` (~1 МБ + 1 МБ)
-15. `rci_create_policies()` — только для `policy_names` (POST + save)
-16. `ipset_manager_init()` + установка `g_ipset_mgr.default_timeout` (из `IpsetEnableTimeout`/`IpsetTimeout`) + `initialize_ipsets()` — создание/очистка ipset-пар для всех `g_all_sorted`
-17. `add_cidr_to_ipsets()` — если `CIDR=true` и `cidr_file_path` задан
-18. `build_geosite_domain_map()` — если `gs_count > 0` (правила `geosite:` распарсены один раз на шаге 10 и переиспользуются)
-19. `drm_setup_all_routes()` — `ip rule` + `ip route` для DirectRoute
-20. `apply_unified_connmark_rules()`
-21. Если `conntrack_flush` — `conntrack_mgr_init()` (при ошибке flush отключается)
-22. `pkt_capture_init()` — два `AF_PACKET SOCK_DGRAM/ETH_P_ALL` сокета (`fd4`, `fd6`)
-23. Если `l7_capture_enabled`: `l7_firewall_resolve_wan` (при неудаче — L7 отключается с `LOG_WARN`, DNS-only); `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`; при неудаче — L7 отключается, DNS-only, **без fallback**). Иначе: `l7_firewall_load_kmod("xt_connbytes")`; `l7_dispatch_set_enable` (с флагами tls/http/quic); при `l7_tcp_reasm_enabled` — `tcp_reasm_init` + `l7_dispatch_set_reasm` (`g_reasm_active=1`); `nflog_capture_init`; `l7_firewall_install` (NFLOG в `mangle/FORWARD`+`OUTPUT` для TCP 443/80 и при `l7_enable_quic` — UDP 443 с `--length 1200:`). `g_l7_active=1` при успехе
-24. `signal_mgr_init()` — `sigprocmask` + `signalfd` + `timerfd`
-25. `epoll_create1()` — регистрация `cap.fd4`, `cap.fd6`, `signals.sig_fd`, `signals.timer_fd`; при `g_l7_active` — `nflog_fd`; при `g_reasm_active` — `reasm_gc_fd` (`timerfd` 1s)
-26. Основной цикл `epoll_wait` (`events[8]`)
-27. **Cleanup:** `signal_mgr_close` → `l7_firewall_remove` + `nflog_capture_close` → `tcp_reasm_close` (если `g_reasm_active`) → `pkt_capture_close` → `conntrack_mgr_close` → `drm_cleanup_all_routes` → `cleanup_connmark_rules` → `ipset_manager_close` → `rci_client_close` → `ht_destroy` → `remove_pid_file` → `log_close`
+14. `rci_create_policies()` — только для `policy_names` (один POST: массив `parse`-команд + `save` последним элементом)
+15. `ipset_manager_init()` + установка `g_ipset_mgr.default_timeout` (из `IpsetEnableTimeout`/`IpsetTimeout`) + `initialize_ipsets()` — создание/очистка ipset-пар для всех `g_all_sorted`
+16. `add_cidr_to_ipsets()` — если `CIDR=true` и `cidr_file_path` задан
+17. `build_geosite_domain_map()` — если `gs_count > 0` (правила `geosite:` распарсены один раз на шаге 10 и переиспользуются)
+18. `drm_setup_all_routes()` — `ip rule` + `ip route` для DirectRoute
+19. `apply_unified_connmark_rules()`
+20. Если `conntrack_flush` — `conntrack_mgr_init()` (при ошибке flush отключается)
+21. `pkt_capture_init()` — два `AF_PACKET SOCK_DGRAM/ETH_P_ALL` сокета (`fd4`, `fd6`)
+22. Если `l7_capture_enabled`: `l7_firewall_resolve_wan` (при неудаче — L7 отключается с `LOG_WARN`, DNS-only); `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`; при неудаче — L7 отключается, DNS-only, **без fallback**). Иначе: `l7_firewall_load_kmod("xt_connbytes")`; `l7_dispatch_set_enable` (с флагами tls/http/quic); при `l7_tcp_reasm_enabled` — `tcp_reasm_init` + `l7_dispatch_set_reasm` (`g_reasm_active=1`); `nflog_capture_init`; `l7_firewall_install` (NFLOG в `mangle/FORWARD`+`OUTPUT` для TCP 443/80 и при `l7_enable_quic` — UDP 443 с `--length 1200:`). `g_l7_active=1` при успехе
+23. `signal_mgr_init()` — `sigprocmask` + `signalfd` + `timerfd`
+24. `epoll_create1()` — регистрация `cap.fd4`, `cap.fd6`, `signals.sig_fd`, `signals.timer_fd`; при активном conntrack flush — `g_conntrack.fd` (async DUMP); при `g_l7_active` — `nflog_fd`; при `g_reasm_active` — `reasm_gc_fd` (`timerfd` 1s)
+25. Основной цикл `epoll_wait` (`events[8]`)
+26. **Cleanup:** `signal_mgr_close` → `l7_firewall_remove` + `nflog_capture_close` → `tcp_reasm_close` (если `g_reasm_active`) → `pkt_capture_close` → `conntrack_mgr_close` → `drm_cleanup_all_routes` → `cleanup_connmark_rules` → `ipset_manager_close` → `ht_destroy` → `remove_pid_file` → `log_close`
 
 ---
 
@@ -328,7 +329,7 @@ dns_result_t {
 3. `ipset_add_batch` для IPv4 (`setname`, `with_timeout=1`)
 4. `ipset_add_batch` для IPv6 (`setname + "v6"`, `with_timeout=1`)
 5. `LOG_PROCESSED` для каждого реально добавленного (нового) IP
-6. `conntrack_flush_for_ips()` если `allow_conntrack_flush=1` И `conntrack_flush=1` И есть новые IP (для каждого нового IP DUMP+DELETE по dst; DELETE отправляется только при существующих conntrack-записях к этому IP, иначе DUMP вхолостую). DNS-канал передаёт `allow_conntrack_flush=1`; L7-канал — `0` (полный DUMP за L7 не выполняется, вместо него — точечный DELETE по 5-tuple в `process_hostname_event_l7`).
+6. `conntrack_flush_request()` если `allow_conntrack_flush=1` И `conntrack_flush=1` И есть новые IP — новые IP кладутся в pending-буфер, DUMP+DELETE выполняются асинхронно в epoll-цикле (`conntrack_process`), обработка DNS не блокируется. DNS-канал передаёт `allow_conntrack_flush=1`; L7-канал — `0` (полный DUMP за L7 не выполняется, вместо него — точечный DELETE по 5-tuple в `process_hostname_event_l7`).
 
 ### `process_hostname_event_l7(host, proto, conn)`
 
@@ -502,7 +503,7 @@ struct pool_chunk {
 **Файл:** `src/iptables.c`, функция `apply_unified_connmark_rules()`.
 
 1. `get_br0_global_ipv6()`: `ip addr show br0` — получает IPv6-сеть `scope global` (нужна только она: IPv6-правила для политик ставятся лишь при её наличии)
-2. Внутренний retry loop (до 5 попыток, sleep 4s): `rci_get_policies_with_retry()` + проверка наличия `mark` для каждой не-interface цели. Если хотя бы одна политика без `mark` — повтор через 4 секунды
+2. Внутренний retry loop (до 5 попыток, sleep 4s): для каждой не-interface цели точечный `rci_get_policy_mark_with_retry()` в `policy_marks[i]` (индекс общий с `targets[]`). Если хотя бы одна политика без `mark` — повтор через 4 секунды
 3. Оба семейства обрабатываются единым кодом через массив дескрипторов `connmark_family_t[2]` (`{ipt_cmd, restore_cmd, rules_cache, batch}`: `iptables`/`iptables-restore` и `ip6tables`/`ip6tables-restore`); для каждого семейства кэшируются текущие правила `-w -t mangle -S PREROUTING`
 4. Для каждого `unified_target` × семейство:
    - **Интерфейс:** `mark = fwmark` (hex); **Политика:** `mark` из RCI-ответа; если `mark` пуст — цель пропускается с `[WARN]`
@@ -725,7 +726,7 @@ geosite_domain_t { type uint32, value char* }
 | `0` | Plain (keyword) | пропускается с `[WARN]` |
 | `1` | Regex | пропускается с `[WARN]` |
 | `2` | Domain (домен + поддомены) | `ht_insert` с `match_subs=1` |
-| `3` | Full (только точное имя) | `ht_insert` с `match_subs=0` |
+| `3` | Full | `ht_insert` с `match_subs=1` |
 
 ### Парсинг `.dat`-файлов
 
@@ -738,12 +739,6 @@ geosite_domain_t { type uint32, value char* }
 - `parse_cidr_body()`, `parse_geosite_body()`, `parse_geosite_domain()` — тонкие switch'и по номеру protobuf-поля поверх `pb_next_field`
 - Хелперы: `upcase_inplace`/`upcase_buf` (единственное место ASCII-uppercase), `extract_geoip_country` (разбор `geoip:<tag>`: trim + копия), `cidr_classify` + `copy_block_name` (грамматика строк CIDRfile: BLANK / DISABLED / HEADER / ENTRY — один классификатор для сканера, мигратора и `parse_cidr_policy_headers`)
 
-### `deduplicate_domains(domains, count)`
-
-1. Фильтрует только `Type=2` и `Type=3`
-2. Сортирует по количеству точек (от меньшего к большему — root → leaf)
-3. Удаляет поддомены через временную хеш-таблицу: если домен суффикс уже принятого — отбрасывается
-
 ### `parse_geosite_rules(watchlist_path, rules, max_rules)`
 
 - Читает `domain.conf` через `getline()`, собирает все `geosite:`-записи
@@ -751,10 +746,9 @@ geosite_domain_t { type uint32, value char* }
 
 ### `build_geosite_domain_map(filePaths, fileCount, rules, ruleCount, ht)`
 
-- Для каждого `rule.tag` обходит все `filePaths`, объединяет домены, `deduplicate`
-- `Type=2`: `ht_insert(val, match_subs=1)`
-- `Type=3`: `ht_insert(val, match_subs=0)`
-- `ht_insert` не перезаписывает существующие → приоритет у `domain.conf`
+- Для каждого `rule.tag` обходит все `filePaths`, объединяет домены
+- `Type=2` (Domain) и `Type=3` (Full): `ht_insert(val, match_subs=1)` — как записи `domain.conf`
+- `ht_insert` не перезаписывает существующие → приоритет у `domain.conf`, дубликаты игнорируются
 
 ### `parse_cidr_policy_headers(path, names, max_names)`
 
@@ -821,18 +815,12 @@ hrneo взаимодействует с роутером Keenetic **исключ
 | Константа | Значение | Назначение |
 |-----------|----------|------------|
 | `RCI_PORT` | `DEFAULT_API_PORT` (79) | захардкожен, параметра конфига нет |
-| `RCI_MAX_RESPONSE` | `1024 * 1024` (1 МБ) | буфер выделяется через `malloc` при `rci_client_init` |
-| `POLICY_API_MAX_RETRIES` | `5` | попыток на `GET /rci/show/ip/policy/` |
+| `RCI_RAW_MAX` (rci.c) | `32768` | статический приёмный буфер `rci_request` |
+| `POLICY_API_MAX_RETRIES` | `5` | попыток на точечный `GET .../mark` |
 | `POLICY_API_RETRY_DELAY` | `3` (секунды) | интервал между попытками |
 | `RCI_TIMEOUT_SEC` | `10` | `SO_RCVTIMEO` и `SO_SNDTIMEO` |
 
-### `rci_client_t { raw_buf, response_buf }`
-
-- `raw_buf` — сырой HTTP-приём (`RCI_MAX_RESPONSE + 4096`; +4096 для заголовков)
-- `response_buf` — буфер тела ответа после парсинга (`RCI_MAX_RESPONSE`)
-- Оба выделяются в `rci_client_init()` и переиспользуются весь lifetime демона. Никаких `malloc` при `SIGUSR1` → нет фрагментации heap, нет latency
-
-`rci_client_close`: `free` обоих буферов.
+Клиент не имеет состояния и heap-аллокаций: приёмный буфер — статический 32 КБ в `rci_request` (однопоточный демон), ответы точечных GET — десятки байт. Ранее держались два `malloc`-буфера по ~1 МБ на весь lifetime демона ради разового парсинга полного дерева политик.
 
 ### Сетевой клиент
 
@@ -843,7 +831,7 @@ hrneo взаимодействует с роутером Keenetic **исключ
 - `connect` к `127.0.0.1:79` (`INADDR_LOOPBACK` через `htonl`)
 - HTTP/1.0 `Connection: close` (по умолчанию) — каждый запрос = новое TCP-соединение, ответ читается до EOF (закрытия сокета сервером)
 
-#### `rci_request(c, method, path, body, body_len, response, response_max)`
+#### `rci_request(method, path, body, body_len, response, response_max)`
 
 1. `rci_connect`; при неудаче — `LOG_ERROR` + `return -1`
 2. Формирование HTTP-заголовка через `snprintf` (не `fork+printf`):
@@ -857,83 +845,63 @@ hrneo взаимодействует с роутером Keenetic **исключ
    ```
 
 3. `send` заголовка; при `body` — отдельный `send` цикла `body_len` байт
-4. `recv` цикл в `c->raw_buf` (до `RCI_MAX_RESPONSE+4096-1` байт или EOF/0)
+4. `recv` цикл в статический `raw[RCI_RAW_MAX]` (до 32 КБ − 1 или EOF/0)
 5. Парсинг ответа:
    - `strstr("\r\n\r\n")` — граница заголовков и тела
    - `strncmp(raw, "HTTP/", 5)` — sanity-check
-   - `strchr(raw, ' ') + atoi` — код статуса; не 200 → `LOG_ERROR` + `return -1`
+   - `strchr(raw, ' ') + atoi` — код статуса; не 200 → `return RCI_HTTP_FAIL (-2)` (транспортная ошибка `-1` различима от HTTP-ошибки: 404 для точечного GET — «политики нет», не сбой сети)
 6. `memcpy` тела в `response` (обрезка до `response_max-1`)
 
-### Парсер JSON ответа `/rci/show/ip/policy/`
+### Извлечение `markID`: точечный GET
 
-Ответ имеет стабильный формат (политики Keenetic — простая структура, безопасно парсить вручную):
+Вложенные пути работают в RCI **только прямым GET** (в батч-POST под `/rci/` под-атрибуты `show`-команд не поддерживаются — `1179781 not found`, проверено на 5.0.12):
 
-```json
-{
-  "HydraRoute": {"description":"...", "mark":"0x21", ...},
-  "RU":        {"description":"...", "mark":"0x22", ...}
-}
+```
+GET /rci/show/ip/policy/HydraRoute/mark  →  "ffffaaa"   (HTTP 200, ~10 байт)
+GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 ```
 
-#### `find_matching_brace(open_brace)` — сканер с подсчётом фигурных скобок
+#### `rci_get_policy_mark(name, mark, mark_size)`
 
-- `depth++` на `{`, `depth--` на `}`; возврат при `depth==0`
-- `in_string`-флаг переключается на не-экранированной `"`; внутри строки скобки игнорируются (защита от литералов вида `"value with {}"`)
-- Не полноценный JSON-парсер (нет обработки escape-последовательностей внутри значений, нет валидации синтаксиса); достаточно для формата RCI
+1. `rci_request GET /rci/show/ip/policy/<name>/mark`
+2. Транспортная ошибка → `-1`; HTTP ≠ 200 → `0` (политики нет или `mark` ещё не назначен)
+3. Значение между кавычками, префикс `"0x"`/`"0X"` удаляется (для прямой подстановки в `--set-xmark`), копия в `mark` (усечение до `mark_size-1`)
+4. `LOG_DEBUG "RCI policy: %s mark=0x%s"`, возврат `1`
 
-#### `rci_get_policies(c, policies, max_policies)`
+Полное дерево `/rci/show/ip/policy/` (JSON со всеми маршрутами всех политик, растёт с числом маршрутов без ограничений) не выкачивается и не парсится — ручной скобочный парсер и мегабайтные буферы удалены вместе с риском молчаливой поломки на обрезанном ответе.
 
-1. `rci_request GET /rci/show/ip/policy/`
-2. Поиск первого `{` (root)
-3. Цикл по парам `{key: {...}}`:
-   - `strchr('"')` / `strchr('"')` — извлечение имени политики (`key`)
-   - `strchr('{')` + `find_matching_brace` — границы объекта
-   - В объекте: `strstr("\"mark\"")` → `strchr(':')` → `strchr('"')` → `strchr('"')` — извлечение значения `mark`
-   - Префикс `"0x"`/`"0X"` в начале значения удаляется (для прямой подстановки в `--set-xmark`)
-   - `policy_mark_t { name[MAX_POLICY_NAME=64], mark[16] }` заполняется
-   - `LOG_DEBUG "RCI policy: %s mark=0x%s"`
-4. Возврат `count` политик
+#### `rci_get_policy_mark_with_retry(name, mark, mark_size)`
 
-Политики **БЕЗ** ключа `"mark"` (например, только что созданные роутером, у которых ещё не назначен идентификатор маркировки) пропускаются — будут дозаявлены на следующей итерации retry-loop.
-
-#### `rci_get_policies_with_retry(c, policies, max_policies)`
-
-- До `POLICY_API_MAX_RETRIES=5` попыток с интервалом `POLICY_API_RETRY_DELAY=3` секунды; `LOG_WARN` при неудаче, `LOG_ERROR` при исчерпании
-- Этот wrapper защищает от транзитных проблем сети/перегрузки `ndmsv`; если roundtrip <10s — все 5 попыток успеют до общего timeout
+- До `POLICY_API_MAX_RETRIES=5` попыток с интервалом `POLICY_API_RETRY_DELAY=3` секунды **только при транспортных ошибках** (`-1`); `0`/«нет марка» не ретраится здесь — это дело внешнего loop в `apply_unified_connmark_rules`
+- `LOG_WARN` при неудаче, `LOG_ERROR` при исчерпании
 
 ### Создание политик
 
-#### `rci_create_policies(c, names, count)`
+#### `rci_create_policies(names, count)`
 
-1. Формирование тела `POST` вручную:
+1. Формирование тела `POST` вручную — `parse`-команды и `save` **в одном батче** (формат `/rci/` — массив команд, смешанные батчи поддерживаются, проверено на 5.0.12):
 
    ```json
    [{"parse":"ip policy <name1>"},
     {"parse":"ip policy <name2>"},
-    ...]
+    ...,
+    {"system":{"configuration":{"save":true}}}]
    ```
 
-   (массив до 4 КБ; ~50 байт на политику, до ~80 политик в одном запросе). Команда `parse` эквивалентна вводу строки в CLI Keenetic — `ip policy <name>` создаёт пустую политику если её нет, no-op если есть.
-2. `POST /rci/` с этим body
+   (массив до 8 КБ; ~86 байт на политику, лимит `MAX_POLICY_ORDER=64` помещается с запасом). Команда `parse` эквивалентна вводу строки в CLI Keenetic — `ip policy <name>` создаёт пустую политику если её нет, no-op если есть; `save` сохраняет в startup-config (иначе политики пропадут при перезагрузке роутера).
+2. `POST /rci/` с этим body — один запрос вместо прежних двух
 3. `LOG_INFO "Policy creation commands executed"`
-4. Безусловный вызов `rci_save_config()` — иначе изменения не сохранятся в startup-config роутера и пропадут при перезагрузке
-
-#### `rci_save_config(c)`
-
-- `POST /rci/` с `{"system":{"configuration":{"save":true}}}`
-- Эквивалент `system configuration save` в CLI
 
 ### Интеграция с остальным кодом
 
 #### `main.c` (порядок старта)
 
-- 14. `rci_client_init(&g_rci)` — однократное выделение буферов
-- 15. `rci_create_policies(&g_rci, policy_names, policy_count)` — создание политик для всех целей-политик (интерфейсы DirectRoute сюда не попадают)
-- 20. `apply_unified_connmark_rules(&g_rci, ...)` — первое применение правил
+- 14. `rci_create_policies(policy_names, policy_count)` — создание политик для всех целей-политик (интерфейсы DirectRoute сюда не попадают)
+- 19. `apply_unified_connmark_rules(...)` — первое применение правил
 
 #### `iptables.c::apply_unified_connmark_rules` — вызывается при старте и на `SIGUSR1`
 
-Шаг 2: retry loop (до 5, sleep 4s) — внутри `rci_get_policies_with_retry` + проверка наличия `mark` для каждой не-interface цели. Если хотя бы у одной политики `mark` пустой (только что создана, роутер ещё не назначил `markID`) → повтор всего блока через 4 секунды. Двухуровневая защита: `rci_get_policies_with_retry` ловит сетевые ошибки/таймауты, apply-loop ловит «политика создана, но без `markID`».
+Шаг 2: retry loop (до 5, sleep 4s) — внутри для каждой не-interface цели `rci_get_policy_mark_with_retry` в `policy_marks[i]` (индекс совпадает с `targets[]`). Если хотя бы у одной политики `mark` пустой (только что создана, роутер ещё не назначил `markID`) → повтор всего блока через 4 секунды. Двухуровневая защита: `rci_get_policy_mark_with_retry` ловит сетевые ошибки/таймауты, apply-loop ловит «политика создана, но без `markID`».
 
 Если после всех попыток `markID` не появился — `LOG_WARN "Policy %s has no mark ID, skipping"`. Цель пропускается в этой итерации правил, но `ipset` продолжает заполняться DNS/L7-каналами. На следующем `SIGUSR1` цикл повторяется.
 
@@ -948,18 +916,20 @@ hrneo взаимодействует с роутером Keenetic **исключ
 
 ## 14. Netlink Conntrack: `src/conntrack.c`
 
-`conntrack_mgr_t { fd, del_fd }` — два long-lived `NETLINK_NETFILTER` сокета (init однократно в `main`, оба закрываются при выходе). `fd` несёт DUMP-поток, `del_fd` — DELETE-операции: разделение сокетов исключает чтение DELETE-ACK из недочитанного DUMP-потока (рассинхрон). Инициализатор в `main.c` — `{ .fd = -1, .del_fd = -1 }`.
+`conntrack_mgr_t { fd, del_fd, pending[256], pending_count, dump_family, rescan, deleted }` — два long-lived `NETLINK_NETFILTER` сокета (init однократно в `main`, оба закрываются при выходе). `fd` — **неблокирующий** (`SOCK_NONBLOCK`, `SO_RCVBUF` 1МБ), несёт DUMP-поток и зарегистрирован в главном epoll; `del_fd` — DELETE-операции fire-and-forget (без `NLM_F_ACK`). DUMP выполняется асинхронно: однопоточный event loop никогда не блокируется на сканировании таблицы conntrack — это устраняет проигрыш гонки «клиент открыл соединение раньше, чем ipset add» при burst-резолвах (загрузка страницы). Инициализатор в `main.c` — `{ .fd = -1, .del_fd = -1 }`.
 
-### `conntrack_flush_for_ips(m, new_ips, count)`
+### `conntrack_flush_request(m, new_ips, count)` — постановка в очередь
 
-1. Разбивает на `ipv4_set[64][16]` и `ipv6_set[64][16]` по семейству
-2. Для непустых множеств вызывает `ct_flush_family(m, ...)`
+1. Dedup-добавление IP в `pending[]` (по family+ip; переполнение `CT_PENDING_MAX=256` → `LOG_DEBUG`, IP пропускается)
+2. Если DUMP уже в полёте (`dump_family != 0`) — только `rescan = 1` (по завершении текущего DUMP будет один повторный проход, т.к. уже пройденные чанки не сверялись с добавленными IP)
+3. Иначе — `ct_dump_start()` для первого нужного семейства (IPv4 приоритетнее)
 
-### `ct_flush_family(m, family, targets, target_count, ip_len)`
+### `conntrack_process(m)` — обработчик EPOLLIN на `m->fd`
 
-1. `IPCTNL_MSG_CT_GET + NLM_F_DUMP` через `m->fd` — все conntrack-записи семейства
-2. Для каждой записи: `ct_extract_orig_tuple()` → dst IP → `memcmp` с `targets`
-3. `ct_delete_entry(m->del_fd, ...)` при совпадении (`IPCTNL_MSG_CT_DELETE` с тем же `orig tuple` на отдельном сокете); счётчик удалений в `LOG_DEBUG`
+1. Цикл `recv(MSG_DONTWAIT)` до `EAGAIN`; `ENOBUFS` (переполнение rcvbuf) → `LOG_DEBUG` и продолжение
+2. Для каждой записи чанка: `ct_extract_orig_tuple()` → dst IP → сверка с `pending[]` текущего семейства → `ct_delete_entry(m->del_fd, ...)` при совпадении
+3. `NLMSG_DONE`/`NLMSG_ERROR` → `ct_dump_finished()`: переход IPv4→IPv6 (если есть pending IPv6), затем один rescan-проход (если флаг), иначе сброс состояния (`pending_count=0`, `dump_family=0`), счётчик удалений в `LOG_DEBUG`
+4. После каждого чанка — `ct_drain_del_fd()`: неблокирующий сброс сообщений об ошибках DELETE (`LOG_DEBUG`)
 
 ### `conntrack_delete_conn(m, conn)` — точечный DELETE для L7-канала
 
@@ -968,7 +938,7 @@ hrneo взаимодействует с роутером Keenetic **исключ
 - `CTA_TUPLE_IP` (nested): `CTA_IPV4_SRC`/`CTA_IPV6_SRC` = `client_ip`, `CTA_IPV4_DST`/`CTA_IPV6_DST` = `server_ip` (направление original = клиент→сервер, до SNAT — NFLOG-хук стоит на `FORWARD`+`OUTPUT`);
 - `CTA_TUPLE_PROTO` (nested): `CTA_PROTO_NUM`=`c->proto` (IPPROTO_TCP для TLS/HTTP, IPPROTO_UDP для QUIC), `CTA_PROTO_SRC_PORT`=`htons(client_port)`, `CTA_PROTO_DST_PORT`=`htons(server_port)`.
 
-Хелперы построения nested-атрибутов: `ct_put_attr` / `ct_nest_begin` / `ct_nest_end` (флаг `NLA_F_NESTED`). На успех (`nlmsgerr.error==0`) — `LOG_DEBUG "conntrack: deleted L7 conn (family N)"`; запись не найдена (`-ENOENT`) → молча `0`. Удаление коллатерально не затрагивает другие соединения к тому же IP (в отличие от DUMP-по-dst в DNS-канале).
+Хелперы построения nested-атрибутов: `ct_put_attr` / `ct_nest_begin` / `ct_nest_end` (флаг `NLA_F_NESTED`). Отправка fire-and-forget (без `NLM_F_ACK`), после — `ct_drain_del_fd()` (ошибки в `LOG_DEBUG`, `-ENOENT` игнорируется). Удаление коллатерально не затрагивает другие соединения к тому же IP (в отличие от DUMP-по-dst в DNS-канале).
 
 ### Прочие функции
 
@@ -1005,7 +975,7 @@ hrneo взаимодействует с роутером Keenetic **исключ
 
 ## 16. Система сборки: Makefile
 
-**Версия:** 3.14.0-1
+**Версия:** 3.15.0-1
 **Язык:** C (без CGO, без внешних библиотек)
 
 ### Кросс-компиляция
@@ -1083,7 +1053,13 @@ hrneo взаимодействует с роутером Keenetic **исключ
       → header protection removal (AES-128-ECB(hp, sample)) → PN unmask
       → payload decrypt (AES-128-CTR, nonce=iv XOR pn, ctr_start=2)
       → frame walker: PADDING/PING skip, ACK/ACK_ECN full parse (ACK-frame skip)
-      → CRYPTO frame (offset=0) → fake TLS record → tls_extract_sni
+      → CRYPTO frame: offset==0 и CH целиком в пакете → fake TLS record → tls_extract_sni (fast-path);
+        иначе фрагмент (offset, data, len) отдаётся диспетчеру для реассамблеции
+    → [фрагментированный ClientHello, MLKEM/Kyber >1 датаграммы]
+      dispatch: build_quic_key (5-tuple, family|0x80 — отдельно от TCP) →
+      offset==0 → tcp_reasm_start (record_len = 4 + CH body len) / offset>0 → tcp_reasm_feed;
+      complete → quic_ch_to_sni(assembled) → tls_extract_sni. Общий пул с TCP-реассамблецией
+      (`g_reasm`, GC-таймер 1с, TTL 5с); активна при `l7TcpReasmEnabled=true`
     → bogon_check → process_hostname_event_l7(tag="QUIC-SNI")
     → при первом добавлении IP (и ConntrackFlush=true): conntrack_delete_conn(proto=UDP) → точечный DELETE по 5-tuple UDP
 ```
@@ -1100,13 +1076,13 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 - **`src/probe_tls.c`:** `tls_quick_check` (`d[0]=0x16, d[1]=0x03, d[2]<=0x03, d[5]=0x01`), `tls_extract_sni` (record→handshake→ext→SNI type 0, partial-OK, lowercase).
 - **`src/probe_http.c`:** case-insensitive `"\nHost:"`, порт обрезается, IPv6-литерал `[::1]` поддержан.
-- **`src/probe_quic.c`:** QUIC CRYPTO-walker для QUIC v1 (RFC 9001) и v2 (RFC 9369). Long Header detect: бит `0xC0`, версия `0x00000001`/`0x6b3343cf`. Initial-тип: `(pkt[0]&0x30)==0x00` (v1) или `==0x10` (v2). HKDF-цепочка: `initial_secret=HKDF-Extract(salt, DCID)` → `client_secret=HKDF-Expand-Label(is, "client in", 32)` → `key`(16B)/`iv`(12B)/`hp`(16B). Header protection: `mask=AES-128-ECB(hp, sample[pn_offset+4:+20])`, first_byte `&=0x0F` (Long Header), PN-байты XOR mask[1..pn_len]. Payload: AES-128-CTR `nonce=iv XOR pn_be` с `ctr_start=2` (GCM-конвенция). Frame walker: PADDING(0x00)/PING(0x01) skip; ACK(0x02)/ACK_ECN(0x03) — полный разбор через `read_varint` (largest_ack, delay, range_count, first_range, alt-ranges, ECN counts) вместо bail — **ключевое отличие от netwatch**; CRYPTO(0x06) offset==0 → fake TLS record `0x16 0x03 0x01 len[2]` → `tls_extract_sni`. Статические буферы на стеке: `plain[2048]`, `rec[4096]`.
+- **`src/probe_quic.c`:** QUIC CRYPTO-walker для QUIC v1 (RFC 9001) и v2 (RFC 9369). Long Header detect: бит `0xC0`, версия `0x00000001`/`0x6b3343cf`. Initial-тип: `(pkt[0]&0x30)==0x00` (v1) или `==0x10` (v2). HKDF-цепочка: `initial_secret=HKDF-Extract(salt, DCID)` → `client_secret=HKDF-Expand-Label(is, "client in", 32)` → `key`(16B)/`iv`(12B)/`hp`(16B). Header protection: `mask=AES-128-ECB(hp, sample[pn_offset+4:+20])`, first_byte `&=0x0F` (Long Header), PN-байты XOR mask[1..pn_len]. Payload: AES-128-CTR `nonce=iv XOR pn_be` с `ctr_start=2` (GCM-конвенция). Frame walker: PADDING(0x00)/PING(0x01) skip; ACK(0x02)/ACK_ECN(0x03) — полный разбор через `read_varint` (largest_ack, delay, range_count, first_range, alt-ranges, ECN counts) вместо bail — **ключевое отличие от netwatch**; CRYPTO(0x06) — первый найденный фрейм отдаётся наружу через `quic_crypto_frag_t *frag` (`offset`, `data` в статическом `plain[]`, `len`); если `offset==0` и CH целиком в этом фрейме — `quic_ch_to_sni` fast-path (return 1). `quic_ch_to_sni(ch, ch_len, ...)` оборачивает CRYPTO-байты в fake TLS record `0x16 0x03 0x01 len[2]` (len = `ch_len`) → `tls_extract_sni`; используется и fast-path'ом, и после реассамблеции собранного ClientHello. Статические буферы: `plain[2048]`, `rec[QUIC_CH_REC_MAX=8192]` (собранный CH с MLKEM/Kyber крупнее одного датаграма). Реассамблеция многодатаграммного Initial живёт в `l7_dispatch.c` поверх общего `tcp_reasm` — см. ниже.
 - **`src/quic_crypto.c`:** SHA-256 (ctx: `state[8]`, `count`, `buf[64]`, `buf_len`; `sha256_compress` с полным schedule), HMAC-SHA256 (ipad/opad через два ctx-прохода), `hkdf_extract` = HMAC-SHA256(salt, IKM), `hkdf_expand_label` (HkdfLabel = `uint16(len)||uint8(6+label_len)||"tls13 "+label||0x00||0x01`). AES-128: 256-байтовый SBOX, 10-байтовый RCON, `aes_key_schedule` (44 слова, 11 round-keys), `aes_encrypt_block` (SubBytes+ShiftRows+MixColumns через `xtime`+AddRoundKey, column-major layout `s[row+4*col]`), `aes128_ecb_encrypt`, `aes128_ctr_xor` (single key schedule, big-endian counter bytes 12-15). Только целочисленные операции — MIPS soft-float safe.
 - **`src/bogon.c`:** служебные IPv4 (`0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16, >=224`) и IPv6 (`ff00::/8, fc00::/7, fe80::/10, ::, ::1, ::ffff:0:0/96`).
 - **`src/nflog_capture.c`:** свой NFLOG-клиент без `libnetfilter_log` (subsys `NFLOG_SUBSYS=4` = `NFNL_SUBSYS_ULOG`, `PF_BIND`→`CFG_CMD_BIND`→`CFG_MODE` с `copy_range`+`NLBUFSIZ`, `recv MSG_DONTWAIT`, **без verdict** — поток односторонний). `nflog_capture_t { fd, group, seq, portid, callback, user_data, recv_buf[NFLOG_RECV_BUF_SIZE=128KB] }`. Парсинг атрибута `NFULA_PAYLOAD`. Защита от `ENOBUFS` (`LOG_WARN`, копии теряются — мягкая деградация, трафик клиента не страдает).
 - **`src/l7_firewall.c`:** `l7_firewall_resolve_wan` (config + `stat /sys/class/net`, иначе `/proc/net/route Destination==00000000`), `l7_firewall_load_kmod` / `l7_firewall_load_nflog_modules` (`nfnetlink_log`+`xt_NFLOG` через `init_module(2)`, нет `modprobe` на Keenetic), `install/remove` (`fork+exec iptables -w`, `-C ... || -A` для идемпотентности; `-D` в цикле). Правила TCP ставятся в обе цепочки `FORWARD`+`OUTPUT` × `iptables`/`ip6tables`. При `l7_enable_quic` — дополнительно UDP/443 с `--length 1200:` (длина ≥1200 байт — признак QUIC Initial, обязательно padded по RFC 9000). Для `dport 80` `connbytes_max` ужимается до `min(N, 4)`.
-- **`src/l7_dispatch.c`:** UDP-ветка (до TCP-проверки): `l4_proto==IPPROTO_UDP`, `dport==443`, `quic_extract_sni`, `conn.proto=IPPROTO_UDP`; TCP-ветка: `conn.proto=IPPROTO_TCP` + `try_tls_extract` (fast-path/reasm). `l7_dispatch_set_enable(tls, http, quic)`. `l7_conn_t` (`include/l7_dispatch.h`): поля `family`, `proto`, `client_ip[16]`, `server_ip[16]`, `client_port`, `server_port` — контекст нужен для точечного conntrack-DELETE по 5-tuple с корректным proto.
-- **`src/tcp_reasm.c`** (фаза 2): 5-tuple хеш (`TCP_REASM_BUCKETS=64`), пул `calloc-on-init` (`l7TcpReasmMaxEntries × TCP_REASM_BUF_SIZE=16KB`), `start/feed/complete/get/destroy/gc`, seq-упорядочивание (gap→drop, retransmit→no-op), LRU-eviction (`evict_lru` возвращает освобождённый слот — без повторного скана пула), `timerfd` GC (TTL `l7TcpReasmTtlSec`).
+- **`src/l7_dispatch.c`:** UDP-ветка (до TCP-проверки): `l4_proto==IPPROTO_UDP`, `dport==443`, `quic_extract_sni(..., &frag)`, `conn.proto=IPPROTO_UDP`. Если fast-path не вернул SNI, но `frag.found` и есть общий реассамблер (`g_reasm_ref`): `build_quic_key` (тот же 5-tuple `tcp_reasm_key_t`, но `family|=0x80` — QUIC-записи не коллидируют с TCP в общем пуле); `frag.offset==0` → `tcp_reasm_start` с `record_len = 4 + (CH body len из frag.data[1..3])`, иначе `tcp_reasm_lookup`+`tcp_reasm_feed(seq=offset)`; на `tcp_reasm_complete` — `tcp_reasm_get` → `quic_ch_to_sni` → `tcp_reasm_destroy`. Незавершённые сборки чистит общий GC (`tcp_reasm_gc`, TTL 5с). При `l7TcpReasmEnabled=false` реассамблеции QUIC нет — только одно-датаграммный fast-path (как и для длинных TLS ClientHello). TCP-ветка: `conn.proto=IPPROTO_TCP` + `try_tls_extract` (fast-path/reasm). `l7_dispatch_set_enable(tls, http, quic)`. `l7_conn_t` (`include/l7_dispatch.h`): поля `family`, `proto`, `client_ip[16]`, `server_ip[16]`, `client_port`, `server_port` — контекст нужен для точечного conntrack-DELETE по 5-tuple с корректным proto.
+- **`src/tcp_reasm.c`** (фаза 2): 5-tuple хеш (`TCP_REASM_BUCKETS=64`), пул `calloc-on-init` (`l7TcpReasmMaxEntries × TCP_REASM_BUF_SIZE=16KB`), `start/feed/complete/get/destroy/gc`, seq-упорядочивание (gap→drop, retransmit→no-op), LRU-eviction (`evict_lru` возвращает освобождённый слот — без повторного скана пула), `timerfd` GC (TTL `l7TcpReasmTtlSec`). Общий для двух источников: TCP-сегменты (`seq`) и QUIC CRYPTO-фрагменты (`seq`=CRYPTO offset, `record_len`=4+CH body len); QUIC-ключи помечены `family|0x80`, поэтому не коллидируют с TCP-записями в одном пуле. Оба потока байт — уже раскодированный prefix ClientHello, семантика хранилища для них одинакова.
 
 ### 18.3 Архитектурные решения
 
@@ -1120,7 +1096,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 ### 18.4 Известные gaps (НЕ реализовано)
 
-- **QUIC v2 Initial type detection** — версия v2 определяется по `version==0x6b3343cf`; реализована. Не реализовано: Retry-пакеты (DCID меняется на Retry Token), QUIC over IPv6 Extension Headers с нестандартным next_header. На практике Initial packets без Retry — подавляющее большинство случаев.
+- **QUIC v2 Initial type detection** — версия v2 определяется по `version==0x6b3343cf`; реализована. Многодатаграммный Initial (MLKEM/Kyber ClientHello, разбитый на 2+ Initial-пакета) реассамблируется по CRYPTO-offset — реализовано (§18.2, `l7_dispatch.c`). Не реализовано: Retry-пакеты (DCID меняется на Retry Token), несколько CRYPTO-фреймов внутри одного датаграма (берётся первый — на практике клиент кладёт по одному CRYPTO на Initial), QUIC over IPv6 Extension Headers с нестандартным next_header.
 - **ECH (Encrypted ClientHello)** — нерешаемо без MITM
 - **iCloud Private Relay** — зашифрованный туннель, SNI релея (by design не наш)
 
@@ -1130,7 +1106,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 > Бо́льшая часть сведений потеряна т.к. не документировалась.
 
-- **Однопоточная event-driven архитектура.** epoll-цикл: `cap.fd4` + `cap.fd6` + `signals.sig_fd` + `signals.timer_fd` + (опц.) `nflog_fd` + `reasm_gc_fd`. Без GC, без потоков, без каналов.
+- **Однопоточная event-driven архитектура.** epoll-цикл: `cap.fd4` + `cap.fd6` + `signals.sig_fd` + `signals.timer_fd` + (опц.) `g_conntrack.fd` + `nflog_fd` + `reasm_gc_fd`. Без GC, без потоков, без каналов.
 - **Netlink вместо `fork`/`exec` для ipset.** Все `CREATE`, `FLUSH`, `ADD` через прямой netlink-сокет (`NETLINK_NETFILTER`, long-lived).
 - **Батчевая отправка ipset через netlink.** `ipset_add_batch()`: чанки по 256 — send N сообщений, затем recv N ответов. Kernel обрабатывает очередь параллельно с чтением ответов.
 - **`iptables-restore` для batch-правил.** `apply_unified_connmark_rules()`: все `CONNMARK`-правила одним вызовом `iptables-restore --noflush`.
@@ -1139,7 +1115,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 - **Кэш ipset-списков и единый timeout.** `set_names[]` (cache `ipset list -n` при старте) + одно поле `default_timeout` менеджера (timeout одинаков для всех сетов) — в `ipset_add_batch` нет ни хеширования имени, ни риска коллизий.
 - **Общий open-addressed FNV-1a индекс.** `name_index_t` в `geodat` для `batches[]` и `usage[]` (`NAME_INDEX_SLOTS=256`, доступ к имени через `name_at_fn`) — заменяет `O(n)` линейный поиск при большом числе целей.
 - **Debounce SIGUSR1.** `timerfd`: повторный `SIGUSR1` во время обработки откладывается на 5 секунд.
-- **Conntrack flush через netlink.** Два long-lived netlink-сокета (init однократно): `fd` для DUMP-потока, `del_fd` для DELETE — разделение исключает рассинхрон (чтение DELETE-ACK из недочитанного DUMP). Один DUMP на семейство + DELETE по совпадению. Без `fork`/`exec`.
+- **Асинхронный conntrack flush через netlink.** Два long-lived netlink-сокета (init однократно): неблокирующий `fd` для DUMP-потока (в epoll, чанки читаются между DNS-пакетами) + `del_fd` для DELETE fire-and-forget (без `NLM_F_ACK`). Новые IP коалесцируются в pending-буфер — один DUMP на burst вместо DUMP на каждый DNS-ответ, event loop не блокируется на сканировании таблицы. Без `fork`/`exec`.
 - **Стриминговый парсинг .dat-файлов.** Потоковое чтение через `setvbuf(64KB)`. В памяти хранятся только извлечённые записи. Visitor-pattern (`scan_dat_file`).
 - **Статическая аллокация в hot path.** `dns_result_t` (static в `process_dns_packet`), `processed[]`, `ipv4_batch[]`, `ipv6_batch[]`, `all_new[]` — на стеке, без `malloc`. CNAME-записи передаются в матчер как `dns_cname_t` напрямую из результата парсинга — промежуточного копирования на каждый DNS-ответ нет.
 - **Unified targets.** `g_all_sorted[]` объединяет политики и интерфейсы в единый отсортированный массив. `apply_unified_connmark_rules()` обрабатывает все цели одним проходом.
@@ -1153,16 +1129,16 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 ## Резюме
 
-**HRNeo v3.14.0-1** — компактный однопоточный policy routing демон для роутеров Keenetic, написанный на чистом C.
+**HRNeo v3.15.0-1** — компактный однопоточный policy routing демон для роутеров Keenetic, написанный на чистом C.
 
 Два источника имён хостов:
 
 - **DNS-канал** — перехват DNS-ответов через AF_PACKET SOCK_DGRAM + L3-BPF, два fd; работает на интерфейсах любого типа (Ethernet, PPP, ARPHRD_NONE, туннели), поэтому ловит DNS LAN- и VPN-клиентов одним кодом
-- **L7-канал** — TLS SNI / HTTP Host / QUIC Initial SNI исходящих соединений через собственный NFLOG-клиент на raw netlink (пассивное копирование, совместимо с zapret2/nfqws2), при `l7CaptureEnabled`; фаза 2 — TCP-реассамблеция фрагментированных ClientHello; QUIC: CRYPTO-walker с полной HKDF + AES-128-CTR дешифровкой Initial-пакета; при первом добавлении IP (и `ConntrackFlush=true`) триггернувшее соединение разрывается точечным удалением conntrack-записи по 5-tuple (TCP или UDP) для мгновенного реконнекта через политику
+- **L7-канал** — TLS SNI / HTTP Host / QUIC Initial SNI исходящих соединений через собственный NFLOG-клиент на raw netlink (пассивное копирование, совместимо с zapret2/nfqws2), при `l7CaptureEnabled`; фаза 2 — реассамблеция фрагментированных ClientHello: TCP-сегменты и QUIC CRYPTO-фрагменты многодатаграммного Initial (общий пул `tcp_reasm`); QUIC: CRYPTO-walker с полной HKDF + AES-128-CTR дешифровкой Initial-пакета; при первом добавлении IP (и `ConntrackFlush=true`) триггернувшее соединение разрывается точечным удалением conntrack-записи по 5-tuple (TCP или UDP) для мгновенного реконнекта через политику
 
 Извлекает IP-адреса и добавляет в `ipset` через netlink, маркирует трафик в `iptables/mangle` для policy routing. Поддерживает маршрутизацию через политики Keenetic (mark через RCI API) и прямую на интерфейсы (`fwmark` + `ip rule` + `ip route`). GeoIP/GeoSite из `.dat` v2ray/xray с потоковым protobuf-парсингом.
 
-Event-driven архитектура на `epoll` (`cap.fd4` + `cap.fd6` + `signalfd` + `timerfd` + `nflog_fd` + `reasm_gc_fd`).
+Event-driven архитектура на `epoll` (`cap.fd4` + `cap.fd6` + `signalfd` + `timerfd` + `g_conntrack.fd` + `nflog_fd` + `reasm_gc_fd`).
 
 **28 параметров конфига**, все доступны через CLI-флаги (`--flag value`) + `--config <path>`, `--version`/`-v`, `--help`/`-h`, `--genconfig [path]`; приоритет: CLI > конфиг > дефолты. Описание параметров — единая таблица `PARAMS[]` в `src/params.c`, драйвит `config_read`, args, `--help`, `--genconfig`.
 

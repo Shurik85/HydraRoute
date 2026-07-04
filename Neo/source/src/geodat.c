@@ -335,77 +335,6 @@ static int extract_geosite_domains(const char *file_path, const char *tag,
     return rc;
 }
 
-typedef struct {
-    int idx;
-    int dots;
-} dedup_entry_t;
-
-static int compare_dots(const void *a, const void *b) {
-    return ((const dedup_entry_t *)a)->dots - ((const dedup_entry_t *)b)->dots;
-}
-
-static int deduplicate_domains(const geosite_domain_t *domains, int count,
-                               geosite_domain_t **output, int *out_count) {
-    *output = NULL;
-    *out_count = 0;
-
-    dedup_entry_t *entries = malloc(count * sizeof(dedup_entry_t));
-    if (!entries) return -1;
-    int entry_count = 0;
-
-    for (int i = 0; i < count; i++) {
-        if (domains[i].type != GEOSITE_TYPE_DOMAIN && domains[i].type != GEOSITE_TYPE_FULL)
-            continue;
-        int dots = 0;
-        for (const char *p = domains[i].value; *p; p++) {
-            if (*p == '.') dots++;
-        }
-        entries[entry_count++] = (dedup_entry_t){i, dots};
-    }
-
-    if (entry_count == 0) {
-        free(entries);
-        return 0;
-    }
-
-    qsort(entries, entry_count, sizeof(dedup_entry_t), compare_dots);
-
-    domain_hashtable_t *accepted = ht_create();
-    *output = malloc(entry_count * sizeof(geosite_domain_t));
-    if (!accepted || !*output) {
-        ht_destroy(accepted);
-        free(*output);
-        *output = NULL;
-        free(entries);
-        return -1;
-    }
-
-    for (int i = 0; i < entry_count; i++) {
-        const char *val = domains[entries[i].idx].value;
-        int covered = 0;
-
-        const char *p = val;
-        while (*p) {
-            const char *dot = strchr(p, '.');
-            if (!dot) break;
-            p = dot + 1;
-            if (ht_lookup(accepted, p, strlen(p))) {
-                covered = 1;
-                break;
-            }
-        }
-
-        if (!covered) {
-            ht_insert(accepted, val, strlen(val), "1", 0);
-            (*output)[(*out_count)++] = domains[entries[i].idx];
-        }
-    }
-
-    ht_destroy(accepted);
-    free(entries);
-    return 0;
-}
-
 int parse_geosite_rules(const char *watchlist_path,
                         geosite_rule_t *rules, int max_rules) {
     FILE *f = fopen(watchlist_path, "r");
@@ -512,11 +441,16 @@ int build_geosite_domain_map(const char (*file_paths)[512], int file_count,
             continue;
         }
 
-        int plain_skipped = 0, regex_skipped = 0, before_count = 0;
+        int plain_skipped = 0, regex_skipped = 0, inserted = 0;
         for (int i = 0; i < all_count; i++) {
             if (all_domains[i].type == GEOSITE_TYPE_PLAIN) plain_skipped++;
             else if (all_domains[i].type == GEOSITE_TYPE_REGEX) regex_skipped++;
-            else before_count++;
+            else if (all_domains[i].type == GEOSITE_TYPE_DOMAIN ||
+                     all_domains[i].type == GEOSITE_TYPE_FULL) {
+                ht_insert(ht, all_domains[i].value, strlen(all_domains[i].value),
+                          rules[r].policy_name, 1);
+                inserted++;
+            }
         }
         total_plain_skipped += plain_skipped;
         total_regex_skipped += regex_skipped;
@@ -526,29 +460,13 @@ int build_geosite_domain_map(const char (*file_paths)[512], int file_count,
         if (regex_skipped > 0)
             LOG_WARN("geosite:%s: %d Regex-type entries skipped (not implemented)", rules[r].tag, regex_skipped);
 
-        geosite_domain_t *deduped = NULL;
-        int dedup_count = 0;
-        deduplicate_domains(all_domains, all_count, &deduped, &dedup_count);
-
-        LOG_DEBUG("geosite:%s: %d entries total, %d Domain/Full before dedup, %d after dedup",
-                  rules[r].tag, all_count, before_count, dedup_count);
-
-        for (int i = 0; i < dedup_count; i++) {
-            const char *val = deduped[i].value;
-            size_t vlen = strlen(val);
-
-            if (deduped[i].type == GEOSITE_TYPE_FULL) {
-                ht_insert(ht, val, vlen, rules[r].policy_name, 0);
-            } else if (deduped[i].type == GEOSITE_TYPE_DOMAIN) {
-                ht_insert(ht, val, vlen, rules[r].policy_name, 1);
-            }
-        }
+        LOG_DEBUG("geosite:%s: %d entries total, %d Domain/Full inserted",
+                  rules[r].tag, all_count, inserted);
 
         for (int i = 0; i < all_count; i++) {
             free(all_domains[i].value);
         }
         free(all_domains);
-        free(deduped);
     }
 
     if (total_plain_skipped > 0 || total_regex_skipped > 0)

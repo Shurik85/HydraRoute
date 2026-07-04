@@ -33,7 +33,7 @@
 - Поддержка статических CIDR-диапазонов с IPv4 и IPv6
 - Работа с базами GeoIP и GeoSite в формате v2ray/xray `.dat`
 - Перехват DNS-ответов LAN- и VPN-клиентов роутера (Ethernet, PPP, WireGuard, VPN-сервер, IPsec, туннели)
-- Параллельный L7-канал (опц.): TLS SNI, HTTP Host и QUIC Initial SNI через NFLOG с TCP-реассамблецией длинных ClientHello (Kyber/MLKEM)
+- Параллельный L7-канал (опц.): TLS SNI, HTTP Host и QUIC Initial SNI через NFLOG с реассамблецией длинных постквантовых ClientHello (Kyber/MLKEM) — TCP-сегменты и многодатаграммный QUIC Initial (CRYPTO-фрагменты) поверх общего пула
 - Корректная маршрутизация без переподключения (опц. ConntrackFlush)
 - Управление через веб-интерфейс
 
@@ -143,7 +143,7 @@ geosite:google,youtube.com,youtu.be/HydraRoute
 geosite:google,geosite:netflix/HydraRoute
 ```
 
-> GeoSite-домены поддерживают типы Domain (домен + поддомены) и Full (только точное имя)  
+> GeoSite-домены поддерживают типы Domain и Full (оба — домен + все поддомены)  
 > Типы Plain (keyword) и Regex не поддерживаются  
 > Записи из `domain.conf` имеют приоритет над GeoSite
 
@@ -255,7 +255,7 @@ opkg install hrweb
 **HrNeo — управление демоном:**
 - Запуск/остановка службы hrneo
 - Управление GeoIP/GeoSite файлами: загрузка, автообновление по расписанию (с выбором часового пояса), переключение источника (GitHub Loyalsoldier или ZerroLabs RU)
-- Раздел **«DANGER ZONE»** — редактирование всех 27 параметров `hrneo.conf` через формы с подсказками
+- Раздел **«DANGER ZONE»** — редактирование всех 28 параметров `hrneo.conf` через формы с подсказками
 - **Диагностика** — пошаговая проверка маршрутизации для указанного домена (политика, интерфейс, состояние ipset, правила iptables, доступность VPN)
 
 **Info — справка:**

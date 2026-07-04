@@ -17,12 +17,15 @@ int conntrack_mgr_init(conntrack_mgr_t *m) {
     memset(&sa, 0, sizeof(sa));
     sa.nl_family = AF_NETLINK;
 
-    m->fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
+    m->fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_NETFILTER);
     if (m->fd < 0) {
         LOG_ERROR("conntrack socket: %s", strerror(errno));
         return -1;
     }
     bind(m->fd, (struct sockaddr *)&sa, sizeof(sa));
+
+    int rcvbuf = 1 << 20;
+    setsockopt(m->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     m->del_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
     if (m->del_fd < 0) {
@@ -32,6 +35,11 @@ int conntrack_mgr_init(conntrack_mgr_t *m) {
         return -1;
     }
     bind(m->del_fd, (struct sockaddr *)&sa, sizeof(sa));
+
+    m->pending_count = 0;
+    m->dump_family = 0;
+    m->rescan = 0;
+    m->deleted = 0;
     return 0;
 }
 
@@ -101,43 +109,48 @@ static int ct_extract_orig_tuple(const uint8_t *data, int len, int family,
     return -1;
 }
 
-static int ct_delete_entry(int fd, int family, const uint8_t *orig_nla, int orig_nla_len) {
+static void ct_delete_entry(int fd, int family, const uint8_t *orig_nla, int orig_nla_len) {
     uint8_t buf[512];
     memset(buf, 0, sizeof(buf));
 
     struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
     nlh->nlmsg_type = CT_MSG_TYPE_DELETE;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nlh->nlmsg_flags = NLM_F_REQUEST;
     nlh->nlmsg_seq = 2;
 
     uint8_t *nfgen = buf + NLMSG_HDRLEN;
     nfgen[0] = family;
 
     int offset = NLMSG_HDRLEN + 4;
-    if (offset + orig_nla_len > (int)sizeof(buf)) return 0;
+    if (offset + orig_nla_len > (int)sizeof(buf)) return;
     memcpy(buf + offset, orig_nla, orig_nla_len);
     offset += orig_nla_len;
 
     nlh->nlmsg_len = offset;
+    send(fd, buf, offset, 0);
+}
 
-    if (send(fd, buf, offset, 0) < 0) return 0;
-
+static void ct_drain_del_fd(conntrack_mgr_t *m) {
     uint8_t resp[256];
-    int n = recv(fd, resp, sizeof(resp), 0);
-    if (n <= 0) return 0;
+    int n;
+    while ((n = recv(m->del_fd, resp, sizeof(resp), MSG_DONTWAIT)) > 0) {
+        struct nlmsghdr *nh = (struct nlmsghdr *)resp;
+        if (n >= (int)NLMSG_HDRLEN && nh->nlmsg_type == NLMSG_ERROR) {
+            struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(nh);
+            if (err->error != 0)
+                LOG_DEBUG("conntrack delete: errno=%d", -err->error);
+        }
+    }
+}
 
-    struct nlmsghdr *rnh = (struct nlmsghdr *)resp;
-    if (rnh->nlmsg_type == NLMSG_ERROR) {
-        struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(rnh);
-        return (err->error == 0) ? 1 : 0;
+static int ct_pending_has_family(const conntrack_mgr_t *m, int family) {
+    for (int i = 0; i < m->pending_count; i++) {
+        if (m->pending[i].family == family) return 1;
     }
     return 0;
 }
 
-static void ct_flush_family(conntrack_mgr_t *m, int family,
-                            const uint8_t (*targets)[16], int target_count,
-                            int ip_len) {
-    int fd = m->fd;
+static void ct_dump_start(conntrack_mgr_t *m, int family) {
     uint8_t req[64];
     memset(req, 0, sizeof(req));
 
@@ -150,18 +163,53 @@ static void ct_flush_family(conntrack_mgr_t *m, int family,
     uint8_t *nfgen = req + NLMSG_HDRLEN;
     nfgen[0] = family;
 
-    if (send(fd, req, nlh->nlmsg_len, 0) < 0) {
+    if (send(m->fd, req, nlh->nlmsg_len, 0) < 0) {
         LOG_WARN("conntrack dump send: %s", strerror(errno));
+        m->pending_count = 0;
+        m->dump_family = 0;
+        m->rescan = 0;
+        m->deleted = 0;
         return;
     }
+    m->dump_family = family;
+}
+
+static void ct_dump_finished(conntrack_mgr_t *m) {
+    if (m->dump_family == AF_INET && ct_pending_has_family(m, AF_INET6)) {
+        ct_dump_start(m, AF_INET6);
+        return;
+    }
+    if (m->rescan) {
+        m->rescan = 0;
+        ct_dump_start(m, ct_pending_has_family(m, AF_INET) ? AF_INET : AF_INET6);
+        return;
+    }
+    if (m->deleted > 0)
+        LOG_DEBUG("conntrack: deleted %d entries", m->deleted);
+    m->pending_count = 0;
+    m->dump_family = 0;
+    m->deleted = 0;
+}
+
+void conntrack_process(conntrack_mgr_t *m) {
+    if (m->fd < 0) return;
 
     static uint8_t buf[65536];
-    int deleted = 0;
-    int done = 0;
 
-    while (!done) {
-        int n = recv(fd, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+    for (;;) {
+        int n = recv(m->fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == ENOBUFS) {
+                LOG_DEBUG("conntrack dump overrun");
+                continue;
+            }
+            return;
+        }
+        if (n == 0) return;
+
+        int family = m->dump_family;
+        if (family == 0) continue;
+        int ip_len = (family == AF_INET) ? 4 : 16;
 
         int offset = 0;
         while (offset + (int)NLMSG_HDRLEN <= n) {
@@ -169,8 +217,10 @@ static void ct_flush_family(conntrack_mgr_t *m, int family,
             if (nh->nlmsg_len < NLMSG_HDRLEN || offset + (int)nh->nlmsg_len > n)
                 break;
 
-            if (nh->nlmsg_type == NLMSG_DONE) { done = 1; break; }
-            if (nh->nlmsg_type == NLMSG_ERROR) { done = 1; break; }
+            if (nh->nlmsg_type == NLMSG_DONE || nh->nlmsg_type == NLMSG_ERROR) {
+                ct_dump_finished(m);
+                break;
+            }
 
             int attr_off = NLMSG_HDRLEN + 4;
             if ((int)nh->nlmsg_len > attr_off) {
@@ -184,10 +234,11 @@ static void ct_flush_family(conntrack_mgr_t *m, int family,
 
                 if (ct_extract_orig_tuple(data, data_len, family,
                                           &orig_raw, &orig_len, dst_ip) == 0) {
-                    for (int i = 0; i < target_count; i++) {
-                        if (memcmp(targets[i], dst_ip, ip_len) == 0) {
-                            if (ct_delete_entry(m->del_fd, family, orig_raw, orig_len))
-                                deleted++;
+                    for (int i = 0; i < m->pending_count; i++) {
+                        if (m->pending[i].family == family &&
+                            memcmp(m->pending[i].ip, dst_ip, ip_len) == 0) {
+                            ct_delete_entry(m->del_fd, family, orig_raw, orig_len);
+                            m->deleted++;
                             break;
                         }
                     }
@@ -195,10 +246,40 @@ static void ct_flush_family(conntrack_mgr_t *m, int family,
             }
             offset += NLMSG_ALIGN(nh->nlmsg_len);
         }
+
+        ct_drain_del_fd(m);
+    }
+}
+
+void conntrack_flush_request(conntrack_mgr_t *m, const parsed_cidr_t *new_ips, int count) {
+    if (!m || m->fd < 0 || count == 0) return;
+
+    int appended = 0;
+    for (int i = 0; i < count; i++) {
+        int ip_len = (new_ips[i].family == AF_INET) ? 4 : 16;
+        int dup = 0;
+        for (int j = 0; j < m->pending_count; j++) {
+            if (m->pending[j].family == new_ips[i].family &&
+                memcmp(m->pending[j].ip, new_ips[i].ip, ip_len) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) continue;
+        if (m->pending_count >= CT_PENDING_MAX) {
+            LOG_DEBUG("conntrack: pending buffer full, IP skipped");
+            continue;
+        }
+        m->pending[m->pending_count++] = new_ips[i];
+        appended = 1;
     }
 
-    if (deleted > 0)
-        LOG_DEBUG("conntrack: deleted %d entries (family %d)", deleted, family);
+    if (!appended) return;
+    if (m->dump_family != 0) {
+        m->rescan = 1;
+        return;
+    }
+    ct_dump_start(m, ct_pending_has_family(m, AF_INET) ? AF_INET : AF_INET6);
 }
 
 static void ct_put_attr(uint8_t *buf, int *off, uint16_t type,
@@ -223,8 +304,8 @@ static void ct_nest_end(uint8_t *buf, int off, int handle) {
     a->nla_len = (uint16_t)(off - handle);
 }
 
-int conntrack_delete_conn(conntrack_mgr_t *m, const l7_conn_t *c) {
-    if (!m || m->del_fd < 0) return 0;
+void conntrack_delete_conn(conntrack_mgr_t *m, const l7_conn_t *c) {
+    if (!m || m->del_fd < 0) return;
 
     int family = (c->family == AF_INET) ? AF_INET : AF_INET6;
     int ip_len = (family == AF_INET) ? 4 : 16;
@@ -236,7 +317,7 @@ int conntrack_delete_conn(conntrack_mgr_t *m, const l7_conn_t *c) {
 
     struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
     nlh->nlmsg_type = CT_MSG_TYPE_DELETE;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nlh->nlmsg_flags = NLM_F_REQUEST;
     nlh->nlmsg_seq = 3;
 
     buf[NLMSG_HDRLEN] = (uint8_t)family;
@@ -262,46 +343,6 @@ int conntrack_delete_conn(conntrack_mgr_t *m, const l7_conn_t *c) {
 
     nlh->nlmsg_len = off;
 
-    if (send(m->del_fd, buf, off, 0) < 0) return 0;
-
-    uint8_t resp[256];
-    int n = recv(m->del_fd, resp, sizeof(resp), 0);
-    if (n <= 0) return 0;
-
-    struct nlmsghdr *rnh = (struct nlmsghdr *)resp;
-    if (rnh->nlmsg_type == NLMSG_ERROR) {
-        struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(rnh);
-        if (err->error == 0) {
-            LOG_DEBUG("conntrack: deleted L7 conn (family %d)", family);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-void conntrack_flush_for_ips(conntrack_mgr_t *m, const parsed_cidr_t *new_ips, int count) {
-    if (!m || m->fd < 0 || count == 0) return;
-
-    uint8_t ipv4_set[64][16];
-    int ipv4_count = 0;
-    uint8_t ipv6_set[64][16];
-    int ipv6_count = 0;
-
-    for (int i = 0; i < count && i < 64; i++) {
-        if (new_ips[i].family == AF_INET) {
-            memset(ipv4_set[ipv4_count], 0, 16);
-            memcpy(ipv4_set[ipv4_count], new_ips[i].ip, 4);
-            ipv4_count++;
-        } else {
-            memcpy(ipv6_set[ipv6_count], new_ips[i].ip, 16);
-            ipv6_count++;
-        }
-    }
-
-    if (ipv4_count == 0 && ipv6_count == 0) return;
-
-    if (ipv4_count > 0)
-        ct_flush_family(m, AF_INET, (const uint8_t (*)[16])ipv4_set, ipv4_count, 4);
-    if (ipv6_count > 0)
-        ct_flush_family(m, AF_INET6, (const uint8_t (*)[16])ipv6_set, ipv6_count, 16);
+    send(m->del_fd, buf, off, 0);
+    ct_drain_del_fd(m);
 }
