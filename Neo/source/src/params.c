@@ -152,6 +152,11 @@ const param_def_t PARAMS[] = {
       offsetof(config_t, l7_enable_quic),          0,
       BIT(27), 0,            1,
       "<true|false>",            "Parse QUIC Initial SNI on UDP dport 443",    "true"  },
+
+    { "rciToken",             "--rciToken",             PT_STRING,
+      offsetof(config_t, rci_token),              0,
+      BIT(28), MAX_RCI_TOKEN, 0,
+      "<token>",                 "Keenetic RCI access token (X-NDMA-TKN header)", NULL },
 };
 
 const int PARAMS_COUNT = sizeof(PARAMS) / sizeof(PARAMS[0]);

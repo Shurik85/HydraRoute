@@ -10,7 +10,7 @@ typedef struct {
     int fwmark;
 } unified_target_t;
 
-int apply_unified_connmark_rules(rci_client_t *rci, const unified_target_t *targets,
+int apply_unified_connmark_rules(const unified_target_t *targets,
                                  int count, int global_routing);
 int cleanup_connmark_rules(const ipset_pair_t *pairs, int count);
 

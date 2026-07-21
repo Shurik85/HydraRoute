@@ -271,6 +271,27 @@ int main(int argc, char *argv[]) {
     cli_args_t args;
     int ar = args_parse(argc, argv, &args);
     if (ar == 3) return config_generate(args.genconfig_target);
+    if (ar == 4) {
+        const char *kpath = args.config_path[0] ? args.config_path : DEFAULT_CONFIG_PATH;
+        switch (config_set_keenetic_token(kpath, args.keenetic_token)) {
+        case KTOKEN_ADDED:
+            printf("hrneo: Keenetic token added to %s\n", kpath);
+            return 0;
+        case KTOKEN_UPDATED:
+            printf("hrneo: Keenetic token updated in %s\n", kpath);
+            return 0;
+        case KTOKEN_UNCHANGED:
+            printf("hrneo: Keenetic token already set in %s, unchanged\n", kpath);
+            return 0;
+        case KTOKEN_INVALID:
+            fprintf(stderr, "hrneo: invalid Keenetic token\n");
+            return 1;
+        case KTOKEN_IO_ERROR:
+        default:
+            fprintf(stderr, "hrneo: failed to write Keenetic token to %s\n", kpath);
+            return 1;
+        }
+    }
     if (ar > 0) return 0;
     if (ar < 0) return 1;
 
@@ -290,11 +311,14 @@ int main(int argc, char *argv[]) {
     }
 
     args_apply(&args, &g_config);
+    rci_set_token(g_config.rci_token);
 
     if (!g_config.auto_start) return 0;
 
     log_setup(&g_config);
     LOG_INFO("HRNeo v%s starting", VERSION);
+    if (g_config.rci_token[0])
+        LOG_INFO("Keenetic RCI token configured, X-NDMA-TKN authentication enabled");
 
     if (create_pid_file(DEFAULT_PID_FILE) != 0) {
         log_close();

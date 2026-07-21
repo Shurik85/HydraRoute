@@ -12,6 +12,20 @@
 #define RCI_RAW_MAX    32768
 #define RCI_HTTP_FAIL  (-2)
 
+static char g_rci_token[MAX_RCI_TOKEN];
+
+void rci_set_token(const char *token) {
+    int j = 0;
+    if (token) {
+        for (int i = 0; token[i] && j < MAX_RCI_TOKEN - 1; i++) {
+            unsigned char ch = (unsigned char)token[i];
+            if (ch <= 0x20 || ch >= 0x7f) break;
+            g_rci_token[j++] = (char)ch;
+        }
+    }
+    g_rci_token[j] = '\0';
+}
+
 static int rci_connect(void) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
@@ -42,22 +56,30 @@ static int rci_request(const char *method, const char *path,
         return -1;
     }
 
-    char header[512];
+    char tkn_hdr[MAX_RCI_TOKEN + 24];
+    if (g_rci_token[0])
+        snprintf(tkn_hdr, sizeof(tkn_hdr), "X-NDMA-TKN: %s\r\n", g_rci_token);
+    else
+        tkn_hdr[0] = '\0';
+
+    char header[MAX_RCI_TOKEN + 512];
     int hlen;
     if (body && body_len > 0) {
         hlen = snprintf(header, sizeof(header),
             "%s %s HTTP/1.0\r\n"
-            "Host: localhost\r\n"
+            "Host: 127.0.0.1\r\n"
+            "%s"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
             "\r\n",
-            method, path, body_len);
+            method, path, tkn_hdr, body_len);
     } else {
         hlen = snprintf(header, sizeof(header),
             "%s %s HTTP/1.0\r\n"
-            "Host: localhost\r\n"
+            "Host: 127.0.0.1\r\n"
+            "%s"
             "\r\n",
-            method, path);
+            method, path, tkn_hdr);
     }
 
     if (send(fd, header, hlen, 0) != hlen) {

@@ -64,6 +64,7 @@
 #define MAX_INTERFACES      64
 #define MAX_POLICY_NAME     64
 #define MAX_TAG_LEN         64
+#define MAX_RCI_TOKEN       512
 
 #define DOMAIN_HT_BUCKETS  8192
 
@@ -101,6 +102,7 @@ typedef struct {
     int l7_tcp_reasm_max_entries;
     int l7_tcp_reasm_ttl_sec;
     int l7_enable_quic;
+    char rci_token[MAX_RCI_TOKEN];
 } config_t;
 
 typedef struct {

@@ -3,6 +3,7 @@
 #include "../include/log.h"
 #include "../include/util.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -127,4 +128,110 @@ int config_generate(const char *target) {
     fclose(f);
     printf("hrneo: default config written to %s\n", path);
     return 0;
+}
+
+keenetic_token_result_t config_set_keenetic_token(const char *path, const char *token) {
+    if (!token || token[0] == '\0' || strlen(token) >= MAX_RCI_TOKEN)
+        return KTOKEN_INVALID;
+    for (const char *p = token; *p; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch <= 0x20 || ch >= 0x7f) return KTOKEN_INVALID;
+    }
+
+    char *content;
+    long len = 0;
+    FILE *f = fopen(path, "r");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (len < 0) len = 0;
+        if (len > (1 << 20)) len = 1 << 20;
+        content = malloc((size_t)len + 1);
+        if (!content) { fclose(f); return KTOKEN_IO_ERROR; }
+        len = (long)fread(content, 1, (size_t)len, f);
+        content[len] = '\0';
+        fclose(f);
+    } else {
+        content = malloc(1);
+        if (!content) return KTOKEN_IO_ERROR;
+        content[0] = '\0';
+    }
+
+    size_t out_cap = (size_t)len + MAX_RCI_TOKEN + 32;
+    char *out = malloc(out_cap);
+    if (!out) { free(content); return KTOKEN_IO_ERROR; }
+    size_t out_len = 0;
+
+    int found = 0;
+    keenetic_token_result_t result = KTOKEN_ADDED;
+
+    const char *line = content;
+    for (;;) {
+        const char *nl = strchr(line, '\n');
+        size_t seg_len = nl ? (size_t)(nl - line) : strlen(line);
+        if (!nl && seg_len == 0) break;
+
+        int replaced = 0;
+        if (!found) {
+            char tmp[4096];
+            size_t cplen = seg_len < sizeof(tmp) - 1 ? seg_len : sizeof(tmp) - 1;
+            memcpy(tmp, line, cplen);
+            tmp[cplen] = '\0';
+            char *trimmed = trim_whitespace(tmp);
+            if (trimmed[0] != '#' && trimmed[0] != '\0') {
+                char *eq = strchr(trimmed, '=');
+                if (eq) {
+                    char *val = eq + 1;
+                    *eq = '\0';
+                    if (strcmp(trim_whitespace(trimmed), "rciToken") == 0) {
+                        found = 1;
+                        replaced = 1;
+                        char *curval = trim_whitespace(val);
+                        if (strcmp(curval, token) == 0) {
+                            result = KTOKEN_UNCHANGED;
+                            memcpy(out + out_len, line, seg_len);
+                            out_len += seg_len;
+                        } else {
+                            result = curval[0] == '\0' ? KTOKEN_ADDED : KTOKEN_UPDATED;
+                            out_len += (size_t)snprintf(out + out_len, out_cap - out_len,
+                                                        "rciToken=%s", token);
+                        }
+                    }
+                }
+            }
+        }
+        if (!replaced) {
+            memcpy(out + out_len, line, seg_len);
+            out_len += seg_len;
+        }
+
+        if (nl) { out[out_len++] = '\n'; line = nl + 1; }
+        else break;
+    }
+
+    if (!found) {
+        if (out_len > 0 && out[out_len - 1] != '\n')
+            out[out_len++] = '\n';
+        out_len += (size_t)snprintf(out + out_len, out_cap - out_len, "rciToken=%s\n", token);
+        result = KTOKEN_ADDED;
+    }
+
+    if (result == KTOKEN_UNCHANGED) {
+        free(content);
+        free(out);
+        return result;
+    }
+
+    char tmp_path[MAX_PATH_LEN + 8];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    FILE *wf = fopen(tmp_path, "w");
+    if (!wf) { free(content); free(out); return KTOKEN_IO_ERROR; }
+    int wok = fwrite(out, 1, out_len, wf) == out_len;
+    if (fclose(wf) != 0) wok = 0;
+    free(content);
+    free(out);
+    if (!wok) { unlink(tmp_path); return KTOKEN_IO_ERROR; }
+    if (rename(tmp_path, path) != 0) { unlink(tmp_path); return KTOKEN_IO_ERROR; }
+    return result;
 }

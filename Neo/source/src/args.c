@@ -25,6 +25,10 @@ static void print_help(void) {
            "no path: next to the binary; path is a dir: <dir>/hrneo.conf;");
     printf("  %-*s    %s\n", HELP_FLAG_WIDTH, "",
            "path is a file: written as given");
+    printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--keenetic <token>",
+           "Write Keenetic RCI token to config and exit");
+    printf("  %-*s    %s\n", HELP_FLAG_WIDTH, "",
+           "adds if absent/empty, overwrites if different, skips if same");
     printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--version, -v", "Print version and exit");
     printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--help, -h",    "Print this help and exit");
     printf("\nPriority: CLI flags > config file > built-in defaults\n");
@@ -62,6 +66,16 @@ int args_parse(int argc, char *argv[], cli_args_t *out) {
             }
             return 3;
         }
+        if (strcmp(arg, "--keenetic") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "hrneo: missing value for --keenetic\n");
+                return -1;
+            }
+            strncpy(out->keenetic_token, argv[++i], MAX_RCI_TOKEN - 1);
+            out->keenetic_token[MAX_RCI_TOKEN - 1] = '\0';
+            out->keenetic = 1;
+            continue;
+        }
 
         const param_def_t *p = NULL;
         for (int k = 0; k < PARAMS_COUNT; k++) {
@@ -85,6 +99,7 @@ int args_parse(int argc, char *argv[], cli_args_t *out) {
         out->set_mask |= p->set_bit;
     }
 
+    if (out->keenetic) return 4;
     return 0;
 }
 

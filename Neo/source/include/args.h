@@ -12,6 +12,8 @@
 typedef struct {
     char config_path[MAX_PATH_LEN];
     char genconfig_target[MAX_PATH_LEN];
+    char keenetic_token[MAX_RCI_TOKEN];
+    int keenetic;
     uint32_t set_mask;
     config_t overlay;
 } cli_args_t;

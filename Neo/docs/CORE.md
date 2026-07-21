@@ -15,7 +15,7 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
 
 ### Принцип работы (пошагово)
 
-1. Читается конфигурация из `/opt/etc/HydraRoute/hrneo.conf` (28 параметров; CLI-флаги поверх конфига; недостающие — встроенные дефолты).
+1. Читается конфигурация из `/opt/etc/HydraRoute/hrneo.conf` (29 параметров; CLI-флаги поверх конфига; недостающие — встроенные дефолты).
 
 2. Если `DirectRouteEnabled=true` — сканируется `/sys/class/net/`, строится карта системных интерфейсов (`drm_scan_interfaces`): для каждого имени читается `/sys/class/net/<name>/operstate` (`up`/`down`/`unknown`). Карта нужна, чтобы при разборе watchlist различать «политика Keenetic» и «сетевой интерфейс для DirectRoute».
 
@@ -173,7 +173,7 @@ DNS-ответ dnsmasq → клиент (любой интерфейс: br0/WG/V
 
 > В `hrneo.h` **НЕТ** `arena_t` / `ARENA_SIZE` — все временные буферы статические/на стеке.
 
-### `config_t` (28 полей)
+### `config_t` (29 полей)
 
 См. `src/params.c` и `docs/HRNEO.CONF.md`. Поля:
 
@@ -204,6 +204,7 @@ int                     g_reasm_active;
    - `--version`/`-v`: `return 1` (`main → 0`)
    - `--help`/`-h`: `return 2 → 0`
    - `--genconfig [path]`: `return 3 → main` вызывает `config_generate(args.genconfig_target)`
+   - `--keenetic <token>`: `return 4 → main` вызывает `config_set_keenetic_token(cfg_path, args.keenetic_token)`
    - ошибка: `return -1 → 1`
 2. `sigprocmask(SIG_BLOCK)` для `SIGINT`/`SIGTERM`/`SIGUSR1`
 3. `config_read()` — путь из `args.config_path` или `DEFAULT_CONFIG_PATH`; явный `--config` при недоступном файле → выход 1
@@ -686,6 +687,7 @@ geoip:ru
 |------|------------|
 | `config_path` `char[512]` | путь к конфигу (`--config`); пусто = использовать `DEFAULT_CONFIG_PATH` |
 | `genconfig_target` `char[512]` | путь для `--genconfig` |
+| `keenetic_token` `char[512]` + `keenetic` `int` | токен и флаг режима `--keenetic` |
 | `set_mask` `uint32_t` | битовая маска: по одному биту на каждый параметр |
 | `overlay` `config_t` | scratch-конфиг, в который CLI-флаги парсятся тем же `param_apply`, что и файл; дублирующего набора полей нет |
 
@@ -696,10 +698,11 @@ geoip:ru
 - `--help`/`-h`: выводит справку, возвращает 2
 - `--config <path>`: парсит путь, продолжает
 - `--genconfig [path]`: возвращает 3 (`main → config_generate`)
+- `--keenetic <token>`: сохраняет токен, продолжает парсинг (чтобы учесть `--config` в любом порядке), в конце возвращает 4 (`main → config_set_keenetic_token`)
 - Для всех остальных флагов — поиск по `PARAMS[]`; неизвестный → `"unknown option"`, `return -1`
 - Значение применяется в `out->overlay` через `param_apply(&out->overlay, p, val, 1)`; невалидное → `"invalid value"`, `return -1`
 - При успехе `set_mask |= p->set_bit`
-- Возвращает `0` (успех), `1` (`--version`), `2` (`--help`), `3` (`--genconfig`), `-1` (ошибка)
+- Возвращает `0` (успех), `1` (`--version`), `2` (`--help`), `3` (`--genconfig`), `4` (`--keenetic`), `-1` (ошибка)
 
 ### `args_apply(args, cfg)`
 
@@ -838,7 +841,7 @@ hrneo взаимодействует с роутером Keenetic **исключ
 
    ```http
    <METHOD> <PATH> HTTP/1.0
-   Host: localhost
+   Host: 127.0.0.1
    Content-Type: application/json     # только при body
    Content-Length: <N>                # только при body
 
@@ -1140,6 +1143,6 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 Event-driven архитектура на `epoll` (`cap.fd4` + `cap.fd6` + `signalfd` + `timerfd` + `g_conntrack.fd` + `nflog_fd` + `reasm_gc_fd`).
 
-**28 параметров конфига**, все доступны через CLI-флаги (`--flag value`) + `--config <path>`, `--version`/`-v`, `--help`/`-h`, `--genconfig [path]`; приоритет: CLI > конфиг > дефолты. Описание параметров — единая таблица `PARAMS[]` в `src/params.c`, драйвит `config_read`, args, `--help`, `--genconfig`.
+**29 параметров конфига**, все доступны через CLI-флаги (`--flag value`) + `--config <path>`, `--version`/`-v`, `--help`/`-h`, `--genconfig [path]`, `--keenetic <token>`; приоритет: CLI > конфиг > дефолты. Описание параметров — единая таблица `PARAMS[]` в `src/params.c`, драйвит `config_read`, args, `--help`, `--genconfig`.
 
 **Оптимизирован:** батчевый netlink (send N / recv N), хеш-таблица доменов 8192 бакетов с chunked pool (256КБ чанки), unified targets, batch `iptables-restore`, debounce сигналов, conntrack flush через netlink с long-lived сокетом, статическая аллокация в hot path, двунаправленный CNAME BFS, BPF-фильтрация в ядре, `ipset CREATE` с автоматическим запросом kernel-revision, контроль `maxelem` с автомиграцией oversized `geoip:TAG` в disabled-секцию `CIDRfile`.

@@ -6,4 +6,14 @@
 int config_read(const char *path, config_t *cfg);
 int config_generate(const char *target);
 
+typedef enum {
+    KTOKEN_ADDED,
+    KTOKEN_UPDATED,
+    KTOKEN_UNCHANGED,
+    KTOKEN_INVALID,
+    KTOKEN_IO_ERROR
+} keenetic_token_result_t;
+
+keenetic_token_result_t config_set_keenetic_token(const char *path, const char *token);
+
 #endif
